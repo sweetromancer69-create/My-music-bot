@@ -1,22 +1,32 @@
+cat << 'EOF' > main.py
 import os
 import asyncio
 import logging
+from typing import Any, Dict, Optional
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.methods import TelegramMethod
 import yt_dlp
 from mutagen.easyid3 import EasyID3
 from mutagen.id3 import ID3, APIC
 
-# Данные для доступа
 BOT_TOKEN = "8881412253:AAELisPKS06kE8kIUG2kXZLfo-Jc8wHBMjk"
 ADMIN_ID = 96349161
 PROXY_URL = "http://proxy.server:3128"
 
 logging.basicConfig(level=logging.INFO)
 
-# Инициализация бота с прокси для PythonAnywhere
-session = AiohttpSession(proxy=PROXY_URL)
+class CustomAiohttpSession(AiohttpSession):
+    async def make_request(
+        self,
+        bot: Bot,
+        method: TelegramMethod[Any],
+        timeout: Optional[int] = None,
+    ) -> Any:
+        return await super().make_request(bot, method, timeout=timeout)
+
+session = CustomAiohttpSession(proxy=PROXY_URL)
 bot = Bot(token=BOT_TOKEN, session=session)
 dp = Dispatcher()
 
@@ -29,7 +39,7 @@ def download_audio(url: str) -> dict:
         'format': 'bestaudio/best',
         'outtmpl': out_template,
         'writethumbnail': True,
-        'proxy': PROXY_URL,  # Прокси для yt-dlp
+        'proxy': PROXY_URL,
         'quiet': True,
         'nocheckcertificate': True
     }
@@ -105,7 +115,6 @@ async def handle_download(message: types.Message):
             performer=data['artist']
         )
         
-        # Очистка файлов
         if os.path.exists(data['file_path']):
             os.remove(data['file_path'])
         if data['cover_path'] and os.path.exists(data['cover_path']):
@@ -120,3 +129,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+EOF
