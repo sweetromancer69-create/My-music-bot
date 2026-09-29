@@ -3,3 +3,4 @@ yt-dlp
 aiohttp
 mutagen
 requests
+beautifulsoup4
