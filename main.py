@@ -29,7 +29,7 @@ def download_audio(url: str) -> dict:
         'format': 'bestaudio/best',
         'outtmpl': out_template,
         'writethumbnail': True,
-        'proxy': PROXY_URL,  # Прокси для скачивания через yt-dlp
+        'proxy': PROXY_URL,  # Прокси для yt-dlp
         'quiet': True,
         'nocheckcertificate': True
     }
@@ -53,7 +53,6 @@ def download_audio(url: str) -> dict:
         }
 
 def apply_metadata(file_path: str, title: str, artist: str, album: str, cover_path: str = None):
-    # Метаданные применяем только если файл формата MP3
     if not file_path.endswith('.mp3'):
         return
         
@@ -106,7 +105,7 @@ async def handle_download(message: types.Message):
             performer=data['artist']
         )
         
-        # Очистка файлов после отправки
+        # Очистка файлов
         if os.path.exists(data['file_path']):
             os.remove(data['file_path'])
         if data['cover_path'] and os.path.exists(data['cover_path']):
