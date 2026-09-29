@@ -1,20 +1,22 @@
 import os
 import asyncio
 import logging
-import urllib.parse
+import tempfile
+from pathlib import Path
+
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.client.session.aiohttp import AiohttpSession
 import yt_dlp
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 
-# Получаем переменные окружения
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PROXY_URL = os.getenv("PROXY_URL", "")
 
-# Инициализация бота с поддержкой прокси (если он задан)
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not configured")
+
 if PROXY_URL:
     session = AiohttpSession(proxy=PROXY_URL)
     bot = Bot(token=BOT_TOKEN, session=session)
@@ -23,137 +25,118 @@ else:
 
 dp = Dispatcher()
 
-# Базовые настройки для yt-dlp (конвертация в MP3 + обход блокировок)
-ydl_opts = {
-    'format': 'bestaudio/best',
-    'postprocessors': [{
-        'key': 'FFmpegExtractAudio',
-        'preferredcodec': 'mp3',
-        'preferredquality': '192',
-    }],
-    'outtmpl': '%(id)s.%(ext)s',
-    'quiet': True,
-    # Эмуляция клиентов для обхода проверки "Sign in to confirm you're not a bot"
-    'extractor_args': {
-        'youtube': {
-            'player_client': ['android', 'web'],
-        }
-    },
-    'http_headers': {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    }
-}
 
-# Если в папке проекта есть файл cookies.txt, подключаем его
-if os.path.exists("cookies.txt"):
-    ydl_opts['cookiefile'] = 'cookies.txt'
-    logging.info("Файл cookies.txt найден и успешно подключен к yt-dlp.")
+def get_ydl_options(output_dir):
+    return {
+        "format": "bestaudio/best",
+        "outtmpl": os.path.join(output_dir, "%(title)s.%(ext)s"),
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }
+        ],
+    }
+
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await message.answer("Привет! Отправь мне ссылку на трек (Beatport, Deezer, YouTube и др.), и я найду и скачаю его для тебя в MP3.")
+    await message.answer(
+        "Привет! Отправь ссылку на аудио.\n\n"
+        "Поддерживаемые yt-dlp источники обрабатываются напрямую. "
+        "Для Beatport/Qobuz нужен доступ к разрешённому скачиванию."
+    )
+
 
 @dp.message(F.text)
 async def handle_url(message: types.Message):
     url = message.text.strip()
-    if not url.startswith("http"):
-        await message.answer("Пожалуйста, отправь корректную ссылку.")
+
+    if not url.startswith(("http://", "https://")):
+        await message.answer("Отправь корректную ссылку.")
         return
 
-    await message.answer("Ищу и скачиваю трек, подождите немного...")
+    await message.answer("Проверяю ссылку и подготавливаю аудио...")
 
+    temp_dir = tempfile.mkdtemp(prefix="musicbot_")
     mp3_file = None
+
     try:
-        search_target = url
+        # Не превращаем Beatport/Qobuz в поиск YouTube.
+        with yt_dlp.YoutubeDL(get_ydl_options(temp_dir)) as ydl:
+            info = ydl.extract_info(url, download=True)
 
-        # 1. Если это прямая ссылка на YouTube или SoundCloud, качаем напрямую
-        if "youtube.com" in url or "youtu.be" in url or "soundcloud.com" in url:
-            search_target = url
-        else:
-            # 2. Для заблокированных сторонних сервисов (Beatport, Deezer) формируем поиск
-            extracted_query = None
+            if not info:
+                raise RuntimeError("Не удалось получить информацию об аудио.")
 
-            # Пробуем вытащить метаданные страницы
-            try:
-                extract_opts = {'quiet': True, 'skip_download': True}
-                if os.path.exists("cookies.txt"):
-                    extract_opts['cookiefile'] = 'cookies.txt'
+            if "entries" in info:
+                entries = info["entries"]
+                if not entries:
+                    raise RuntimeError("Аудио не найдено.")
+                info = entries[0]
 
-                with yt_dlp.YoutubeDL(extract_opts) as ydl:
-                    info_meta = ydl.extract_info(url, download=False)
-                    if info_meta:
-                        title = info_meta.get('title')
-                        uploader = info_meta.get('uploader') or info_meta.get('artist')
-                        if title:
-                            extracted_query = f"{uploader} - {title}" if uploader else title
-            except Exception as meta_err:
-                logging.info(f"Metadata extraction failed, falling back to URL parsing: {meta_err}")
+            downloaded = Path(ydl.prepare_filename(info))
+            mp3_file = downloaded.with_suffix(".mp3")
 
-            # Если метаданные недоступны, вырезаем название из URL-адреса (slug)
-            if not extracted_query:
-                parsed_url = urllib.parse.urlparse(url)
-                path_parts = [p for p in parsed_url.path.split('/') if p]
+        if not mp3_file.exists():
+            # Иногда имя после postprocessor отличается.
+            candidates = list(Path(temp_dir).glob("*.mp3"))
 
-                query_slug = ""
-                for i, part in enumerate(path_parts):
-                    if part in ['track', 'release', 'album'] and i + 1 < len(path_parts):
-                        query_slug = path_parts[i + 1]
-                        break
+            if not candidates:
+                raise RuntimeError(
+                    "Источник не предоставил доступный аудиофайл."
+                )
 
-                if not query_slug and path_parts:
-                    candidate = path_parts[-1]
-                    if not candidate.isdigit():
-                        query_slug = candidate
+            mp3_file = candidates[0]
 
-                clean_query = query_slug.replace('-', ' ').replace('_', ' ')
-                if clean_query:
-                    extracted_query = clean_query
+        audio_file = types.FSInputFile(str(mp3_file))
 
-            # Формируем итоговый поисковый запрос
-            if extracted_query:
-                search_target = f"ytsearch1:{extracted_query}"
-                logging.info(f"Formed search query from URL: {search_target}")
-            else:
-                search_target = f"ytsearch1:{url}"
-
-        # 3. Скачивание аудио через yt-dlp
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(search_target, download=True)
-
-            if 'entries' in info:
-                if not info['entries']:
-                    raise Exception("По вашему запросу ничего не найдено.")
-                info = info['entries'][0]
-
-            filename = ydl.prepare_filename(info)
-            base, _ = os.path.splitext(filename)
-            mp3_file = base + ".mp3"
-
-        # Проверяем созданный файл
-        if not mp3_file or not os.path.exists(mp3_file):
-            file_id = info.get('id')
-            if file_id and os.path.exists(f"{file_id}.mp3"):
-                mp3_file = f"{file_id}.mp3"
-            else:
-                raise Exception("Не удалось найти готовый MP3 файл после конвертации.")
-
-        # 4. Отправка файла пользователю
-        audio_file = types.FSInputFile(mp3_file)
-        await message.answer_audio(audio_file)
+        await message.answer_audio(
+            audio_file,
+            title=info.get("title"),
+            performer=info.get("artist") or info.get("uploader"),
+        )
 
     except Exception as e:
-        logging.error(f"Error downloading: {e}")
-        await message.answer(f"Произошла ошибка при скачивании: {e}")
+        logging.exception("Download error")
+
+        error_text = str(e)
+
+        if "Beatport" in error_text:
+            await message.answer(
+                "Beatport не предоставил доступный для этого запроса "
+                "аудиопоток/файл. Если это купленная загрузка, "
+                "скачай официальный файл и отправь его боту."
+            )
+        elif "Qobuz" in error_text:
+            await message.answer(
+                "Qobuz не предоставил доступный для этого запроса "
+                "файл. Для купленных загрузок используй официальный "
+                "Download из My Purchases."
+            )
+        else:
+            await message.answer(
+                "Не удалось скачать аудио.\n\n"
+                f"{error_text[:700]}"
+            )
 
     finally:
-        if mp3_file and os.path.exists(mp3_file):
-            try:
-                os.remove(mp3_file)
-            except Exception as cleanup_err:
-                logging.error(f"Failed to remove temp file: {cleanup_err}")
+        try:
+            for file in Path(temp_dir).glob("*"):
+                file.unlink(missing_ok=True)
+
+            Path(temp_dir).rmdir()
+        except Exception:
+            pass
+
 
 async def main():
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
