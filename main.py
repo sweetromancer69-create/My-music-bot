@@ -1,13 +1,5 @@
 cat << 'EOF' > main.py
 import os
-
-# Задаем переменные окружения для поддержки всех HTTP/HTTPS запросов через прокси PythonAnywhere
-PROXY_URL = "http://proxy.server:3128"
-os.environ["http_proxy"] = PROXY_URL
-os.environ["https_proxy"] = PROXY_URL
-os.environ["HTTP_PROXY"] = PROXY_URL
-os.environ["HTTPS_PROXY"] = PROXY_URL
-
 import asyncio
 import logging
 from aiogram import Bot, Dispatcher, types, F
@@ -19,11 +11,16 @@ from mutagen.id3 import ID3, APIC
 
 BOT_TOKEN = "8881412253:AAELisPKS06kE8kIUG2kXZLfo-Jc8wHBMjk"
 ADMIN_ID = 96349161
+PROXY_URL = "http://proxy.server:3128"
 
 logging.basicConfig(level=logging.INFO)
 
-# Для aiogram 3 достаточно передать proxy в стандартный AiohttpSession
+# Инициализируем сессию aiogram с явным указанием proxy через параметр, 
+# а также подмешиваем базовый url для PythonAnywhere прокси
 session = AiohttpSession(proxy=PROXY_URL)
+# Принудительно меняем сервер API на зеркало или проксируем через стандартный механизм aiogram
+session.api.BASE_URL = "https://api.telegram.org"
+
 bot = Bot(token=BOT_TOKEN, session=session)
 dp = Dispatcher()
 
