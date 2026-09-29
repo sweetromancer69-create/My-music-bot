@@ -1,22 +1,31 @@
 cat << 'EOF' > main.py
 import os
+
+# Явное включение прокси для aiohttp, requests и yt-dlp
+PROXY_URL = "http://proxy.server:3128"
+os.environ["http_proxy"] = PROXY_URL
+os.environ["https_proxy"] = PROXY_URL
+os.environ["HTTP_PROXY"] = PROXY_URL
+os.environ["HTTPS_PROXY"] = PROXY_URL
+
 import asyncio
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.methods import TelegramMethod
+from aiogram.exceptions import TelegramNetworkError
 import yt_dlp
 from mutagen.easyid3 import EasyID3
 from mutagen.id3 import ID3, APIC
 
 BOT_TOKEN = "8881412253:AAELisPKS06kE8kIUG2kXZLfo-Jc8wHBMjk"
 ADMIN_ID = 96349161
-PROXY_URL = "http://proxy.server:3128"
 
 logging.basicConfig(level=logging.INFO)
 
+# Переопределяем make_request, чтобы принудительно передавать proxy в session.post
 class CustomAiohttpSession(AiohttpSession):
     async def make_request(
         self,
@@ -24,7 +33,27 @@ class CustomAiohttpSession(AiohttpSession):
         method: TelegramMethod[Any],
         timeout: Optional[int] = None,
     ) -> Any:
-        return await super().make_request(bot, method, timeout=timeout)
+        session = await self.get_session()
+        url = self.api.api_url(token=bot.token, method=method.api_method)
+        form = self.build_form_data(method)
+
+        try:
+            async with session.post(
+                url,
+                data=form,
+                proxy=PROXY_URL,
+                timeout=self.timeout if timeout is None else timeout,
+            ) as resp:
+                raw = await resp.text()
+        except Exception as e:
+            raise TelegramNetworkError(method=method, message=f"{type(e).__name__}: {e}") from e
+
+        return self.check_response(
+            bot=bot,
+            method=method,
+            status_code=resp.status,
+            content=raw,
+        )
 
 session = CustomAiohttpSession(proxy=PROXY_URL)
 bot = Bot(token=BOT_TOKEN, session=session)
