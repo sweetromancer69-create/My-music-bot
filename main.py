@@ -1,164 +1,75 @@
-cat << 'EOF' > main.py
+import os
 import asyncio
 import logging
-import os
-import re
-import shutil
-from pathlib import Path
-
-import yt_dlp
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
-from aiogram.types import FSInputFile, Message
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
 from aiogram.client.session.aiohttp import AiohttpSession
+import yt_dlp
 
-# ============================================================
-# CONFIG
-# ============================================================
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8881412253:AAELisPKS06kE8kIUG2kXZLfo-Jc8wHBMjk")
+# Получаем переменные окружения
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+PROXY_URL = os.getenv("PROXY_URL", "")
 
-# Реальный адрес прокси для PythonAnywhere
-PROXY_URL = "http://proxy.pythonanywhere.com:3128"
+# Инициализация бота с поддержкой прокси (если он задан)
+if PROXY_URL:
+    session = AiohttpSession(proxy=PROXY_URL)
+    bot = Bot(token=BOT_TOKEN, session=session)
+else:
+    bot = Bot(token=BOT_TOKEN)
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "96349161"))
-
-DOWNLOAD_DIR = Path("downloads")
-DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-MAX_CONCURRENT_DOWNLOADS = 2
-
-# ============================================================
-# LOGGING
-# ============================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-
-logger = logging.getLogger("music-bot")
-
-# ============================================================
-# BOT
-# ============================================================
-
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN не установлен.")
-
-session = AiohttpSession(proxy=PROXY_URL)
-bot = Bot(token=BOT_TOKEN, session=session)
 dp = Dispatcher()
 
-download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+# Настройки для yt-dlp без лишних ограничений
+ydl_opts = {
+    'format': 'bestaudio/best',
+    'postprocessors': [{
+        'key': 'FFmpegExtractAudio',
+        'preferredcodec': 'mp3',
+        'preferredquality': '192',
+    }],
+    'outtmpl': '%(title)s.%(ext)s',
+    'quiet': True,
+}
 
-# ============================================================
-# HELPERS
-# ============================================================
-
-def is_allowed(message: Message) -> bool:
-    if ADMIN_ID == 0:
-        return True
-    return message.from_user is not None and message.from_user.id == ADMIN_ID
-
-def safe_filename(name: str) -> str:
-    name = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", name)
-    name = name.strip(" .")
-    return (name if name else "audio")[:180]
-
-def find_downloaded_audio(directory: Path) -> Path | None:
-    extensions = {".mp3", ".m4a", ".opus", ".ogg", ".wav", ".flac", ".aac", ".webm"}
-    files = [p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in extensions]
-    return max(files, key=lambda p: p.stat().st_mtime) if files else None
-
-def find_cover(directory: Path) -> Path | None:
-    extensions = {".jpg", ".jpeg", ".png", ".webp"}
-    files = [p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in extensions]
-    return max(files, key=lambda p: p.stat().st_mtime) if files else None
-
-# ============================================================
-# DOWNLOAD
-# ============================================================
-
-def download_audio(url: str, job_dir: Path) -> dict:
-    output_template = str(job_dir / "%(title)s.%(ext)s")
-
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": output_template,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "writethumbnail": True,
-        "proxy": PROXY_URL,
-        "nocheckcertificate": True,
-    }
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        audio_file = find_downloaded_audio(job_dir)
-        cover_file = find_cover(job_dir)
-
-        if not audio_file:
-            raise FileNotFoundError("Аудиофайл не найден после загрузки.")
-
-        return {
-            "file": audio_file,
-            "cover": cover_file,
-            "title": info.get("title", "Unknown Title"),
-            "uploader": info.get("artist") or info.get("uploader", "Unknown Artist"),
-        }
-
-# ============================================================
-# HANDLERS
-# ============================================================
-
-@dp.message(CommandStart())
-async def start(message: Message):
-    if not is_allowed(message):
-        return
-    await message.answer("Привет! Отправь мне ссылку на трек для скачивания.")
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await message.answer("Привет! Отправь мне ссылку на трек или видео, и я скачаю его для тебя.")
 
 @dp.message(F.text)
-async def download_handler(message: Message):
-    if not is_allowed(message):
-        return
-
+async def handle_url(message: types.Message):
     url = message.text.strip()
     if not url.startswith("http"):
+        await message.answer("Пожалуйста, отправь корректную ссылку.")
         return
 
-    msg = await message.answer("⏳ Скачивание и обработка...")
-    job_dir = DOWNLOAD_DIR / str(message.message_id)
-    job_dir.mkdir(parents=True, exist_ok=True)
+    await message.answer("Скачиваю трек, подождите немного...")
 
-    async with download_semaphore:
-        try:
-            data = await asyncio.to_thread(download_audio, url, job_dir)
+    try:
+        # Скачивание аудио через yt-dlp
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+            # Меняем расширение на mp3, так как ffmpeg конвертирует его
+            base, _ = os.path.splitext(filename)
+            mp3_file = base + ".mp3"
 
-            await message.answer_audio(
-                audio=FSInputFile(data["file"]),
-                title=data["title"],
-                performer=data["uploader"],
-            )
+        # Отправка файла пользователю
+        audio_file = types.FSInputFile(mp3_file)
+        await message.answer_audio(audio_file)
 
-            await msg.delete()
+        # Удаление файла после отправки
+        if os.path.exists(mp3_file):
+            os.remove(mp3_file)
 
-        except Exception as e:
-            logger.exception(e)
-            await msg.edit_text(f"❌ Ошибка:\n{e}")
-        finally:
-            if job_dir.exists():
-                shutil.rmtree(job_dir, ignore_errors=True)
-
-# ============================================================
-# MAIN
-# ============================================================
+    except Exception as e:
+        logging.error(f"Error downloading: {e}")
+        await message.answer(f"Произошла ошибка при скачивании: {e}")
 
 async def main():
-    logger.info("Бот запущен...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
-EOF
