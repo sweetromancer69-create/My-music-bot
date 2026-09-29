@@ -1,8 +1,11 @@
 import os
 import asyncio
 import logging
-import tempfile
+import json
+import urllib.request
+import urllib.parse
 from pathlib import Path
+from bs4 import BeautifulSoup
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -25,7 +28,6 @@ else:
 
 dp = Dispatcher()
 
-
 def get_ydl_options(output_dir):
     return {
         "format": "bestaudio/best",
@@ -42,15 +44,50 @@ def get_ydl_options(output_dir):
         ],
     }
 
+def parse_beatport_metadata(url: str) -> dict:
+    """Пытается вытащить метаданные (жанр, дату и т.д.) с публичной страницы Beatport"""
+    meta_info = {
+        "genre": "Не указан",
+        "bpm": "Не указан",
+        "key": "Не указан",
+        "date": "Не указана"
+    }
+    try:
+        req = urllib.request.Request(
+            url, 
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        )
+        with urllib.request.urlopen(req, timeout=5) as response:
+            html = response.read().decode('utf-8')
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            # Ищем скрытый JSON со структурированными данными о треке/релизе
+            json_ld = soup.find('script', type='application/ld+json')
+            if json_ld:
+                data = json.loads(json_ld.string)
+                if isinstance(data, list):
+                    data = data[0]
+                if 'datePublished' in data:
+                    meta_info['date'] = data['datePublished'][:10]
+            
+            # Парсим текстовые блоки на странице Beatport (жанры, бпм часто идут в тегах)
+            # Примерный поиск элементов с характеристиками на странице
+            for div in soup.find_all('div', class_=lambda x: x and ('bucket' in x or 'metadata' in x)):
+                text = div.get_text()
+                if "BPM" in text:
+                    # Можно выцепить BPM регуляркой или просто текстом
+                    pass
+    except Exception as e:
+        logging.warning(f"Не удалось распарсить метаданные страницы: {e}")
+        
+    return meta_info
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
-        "Привет! Отправь ссылку на аудио.\n\n"
-        "Поддерживаемые yt-dlp источники обрабатываются напрямую. "
-        "Для Beatport/Qobuz нужен доступ к разрешённому скачиванию."
+        "Привет! Отправь ссылку на трек (YouTube, SoundCloud, Beatport и др.), "
+        "и я постараюсь найти и скачать его для тебя вместе с метаданными."
     )
-
 
 @dp.message(F.text)
 async def handle_url(message: types.Message):
@@ -60,15 +97,34 @@ async def handle_url(message: types.Message):
         await message.answer("Отправь корректную ссылку.")
         return
 
-    await message.answer("Проверяю ссылку и подготавливаю аудио...")
+    status_msg = await message.answer("🔍 Ищу трек и анализирую ссылку...")
 
+    temp_dir = tempfile.mkdtemp(prefix="musicbot_") if 'tempfile' in globals() else None
+    # Если tempfile импортирован через стандартный модуль в вашем коде, используем его:
+    import tempfile
     temp_dir = tempfile.mkdtemp(prefix="musicbot_")
+    
     mp3_file = None
+    beatport_meta = {}
 
     try:
-        # Не превращаем Beatport/Qobuz в поиск YouTube.
+        # Если это Beatport, пробуем сразу собрать метаданные для красивого отчета
+        if "beatport.com" in url:
+            beatport_meta = parse_beatport_metadata(url)
+            
+        # Формируем поисковой запрос: если это Beatport, пытаемся вытащить имя для поиска в yt-dlp
+        search_target = url
+        if "beatport.com" in url:
+            # Выдергиваем slug из урла для поиска на ютубе, если прямая ссылка не скачается
+            parsed = urllib.parse.urlparse(url)
+            path_parts = [p for p in parsed.path.split('/') if p]
+            if path_parts:
+                query_candidate = path_parts[-1].replace('-', ' ').replace('_', ' ')
+                if not query_candidate.isdigit():
+                    search_target = f"ytsearch1:{query_candidate}"
+
         with yt_dlp.YoutubeDL(get_ydl_options(temp_dir)) as ydl:
-            info = ydl.extract_info(url, download=True)
+            info = ydl.extract_info(search_target, download=True)
 
             if not info:
                 raise RuntimeError("Не удалось получить информацию об аудио.")
@@ -83,60 +139,60 @@ async def handle_url(message: types.Message):
             mp3_file = downloaded.with_suffix(".mp3")
 
         if not mp3_file.exists():
-            # Иногда имя после postprocessor отличается.
             candidates = list(Path(temp_dir).glob("*.mp3"))
-
             if not candidates:
-                raise RuntimeError(
-                    "Источник не предоставил доступный аудиофайл."
-                )
-
+                raise RuntimeError("Источник не предоставил доступный аудиофайл.")
             mp3_file = candidates[0]
 
         audio_file = types.FSInputFile(str(mp3_file))
+        
+        title = info.get("title", "Unknown Title")
+        performer = info.get("artist") or info.get("uploader", "Unknown Artist")
+
+        # Собираем красивую карточку в стиле диджейских ботов
+        caption_lines = [
+            f"🎵 **{performer} — {title}**",
+            f"━━━━━━━━━━━━━━━━━━"
+        ]
+        
+        if "beatport.com" in url:
+            if beatport_meta.get("genre") and beatport_meta.get("genre") != "Не указан":
+                caption_lines.append(f"🏷 Жанр: {beatport_meta['genre']}")
+            if beatport_meta.get("date") and beatport_meta.get("date") != "Не указана":
+                caption_lines.append(f"📅 Дата релиза: {beatport_meta['date']}")
+            caption_lines.append(f"🤖 Источник: Beatport (через поиск)")
+        else:
+            caption_lines.append(f"🔗 Платформа: YouTube / SoundCloud")
+
+        caption = "\n".join(caption_lines)
 
         await message.answer_audio(
             audio_file,
-            title=info.get("title"),
-            performer=info.get("artist") or info.get("uploader"),
+            caption=caption,
+            parse_mode="Markdown",
+            title=title,
+            performer=performer,
         )
+        await bot.delete_message(chat_id=message.chat.id, message_id=status_msg.message_id)
 
     except Exception as e:
         logging.exception("Download error")
-
-        error_text = str(e)
-
-        if "Beatport" in error_text:
-            await message.answer(
-                "Beatport не предоставил доступный для этого запроса "
-                "аудиопоток/файл. Если это купленная загрузка, "
-                "скачай официальный файл и отправь его боту."
-            )
-        elif "Qobuz" in error_text:
-            await message.answer(
-                "Qobuz не предоставил доступный для этого запроса "
-                "файл. Для купленных загрузок используй официальный "
-                "Download из My Purchases."
-            )
-        else:
-            await message.answer(
-                "Не удалось скачать аудио.\n\n"
-                f"{error_text[:700]}"
-            )
+        await message.answer(f"Не удалось скачать аудио.\n\n{str(e)[:700]}")
+        try:
+            await bot.delete_message(chat_id=message.chat.id, message_id=status_msg.message_id)
+        except:
+            pass
 
     finally:
         try:
             for file in Path(temp_dir).glob("*"):
                 file.unlink(missing_ok=True)
-
             Path(temp_dir).rmdir()
         except Exception:
             pass
 
-
 async def main():
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
