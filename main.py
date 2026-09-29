@@ -2,121 +2,73 @@ cat << 'EOF' > main.py
 import os
 import asyncio
 import logging
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart
+from aiogram.types import Message, FSInputFile
 from aiogram.client.session.aiohttp import AiohttpSession
 import yt_dlp
-from mutagen.easyid3 import EasyID3
-from mutagen.id3 import ID3, APIC
 
-BOT_TOKEN = "8881412253:AAELisPKS06kE8kIUG2kXZLfo-Jc8wHBMjk"
-ADMIN_ID = 96349161
+# Токен берем из переменных окружения (или подставьте свой, если переменная не задана)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8881412253:AAELisPKS06kE8kIUG2kXZLfo-Jc8wHBMjk")
 PROXY_URL = "http://proxy.server:3128"
 
 logging.basicConfig(level=logging.INFO)
 
-# Инициализируем сессию aiogram с явным указанием proxy через параметр, 
-# а также подмешиваем базовый url для PythonAnywhere прокси
+# КРИТИЧЕСКИ ВАЖНО для PythonAnywhere: передаем прокси в сессию aiogram, 
+# чтобы обойти блокировку бесплатного аккаунта
 session = AiohttpSession(proxy=PROXY_URL)
-# Принудительно меняем сервер API на зеркало или проксируем через стандартный механизм aiogram
-session.api.BASE_URL = "https://api.telegram.org"
-
 bot = Bot(token=BOT_TOKEN, session=session)
 dp = Dispatcher()
 
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-def download_audio(url: str) -> dict:
-    out_template = os.path.join(DOWNLOAD_DIR, '%(id)s.%(ext)s')
+def download_media(url: str):
     ydl_opts = {
-        'format': 'bestaudio/best',
-        'outtmpl': out_template,
-        'writethumbnail': True,
-        'proxy': PROXY_URL,
-        'quiet': True,
-        'nocheckcertificate': True
+        "format": "bestaudio/best",
+        "outtmpl": os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"),
+        "quiet": True,
+        "noplaylist": True,
+        "proxy": PROXY_URL,  # yt-dlp тоже должен качать через прокси PythonAnywhere!
+        "nocheckcertificate": True,
     }
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
-        
-        cover_file = None
-        base_path = os.path.splitext(filename)[0]
-        for ext in ['.jpg', '.webp', '.png', '.jpeg']:
-            if os.path.exists(f"{base_path}{ext}"):
-                cover_file = f"{base_path}{ext}"
-                break
-                
+
         return {
-            'file_path': filename,
-            'cover_path': cover_file,
-            'title': info.get('title', 'Unknown Title'),
-            'artist': info.get('artist') or info.get('uploader', 'Unknown Artist'),
-            'album': info.get('album', '')
+            "file": filename,
+            "title": info.get("title", "Unknown"),
+            "uploader": info.get("uploader", "Unknown"),
         }
 
-def apply_metadata(file_path: str, title: str, artist: str, album: str, cover_path: str = None):
-    if not file_path.endswith('.mp3'):
-        return
-        
-    try:
-        audio = EasyID3(file_path)
-    except Exception:
-        audio = EasyID3()
-        audio.save(file_path)
-    audio['title'] = title
-    audio['artist'] = artist
-    if album:
-        audio['album'] = album
-    audio.save(file_path)
-
-    if cover_path and os.path.exists(cover_path):
-        try:
-            audio_id3 = ID3(file_path)
-            with open(cover_path, 'rb') as albumart:
-                audio_id3.add(APIC(
-                    encoding=3,
-                    mime='image/jpeg' if cover_path.endswith(('.jpg', '.jpeg')) else 'image/png',
-                    type=3,
-                    desc='Cover',
-                    data=albumart.read()
-                ))
-            audio_id3.save(file_path)
-        except Exception:
-            pass
-
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    await message.answer("Привет! Отправь мне ссылку на трек или релиз для скачивания.")
+@dp.message(CommandStart())
+async def start(message: Message):
+    await message.answer("Привет! Отправь мне ссылку на трек, и я скачаю его.")
 
 @dp.message(F.text)
-async def handle_download(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
+async def download_handler(message: Message):
     url = message.text.strip()
-    status_msg = await message.answer("⏳ Скачиваю и обрабатываю трек...")
+    msg = await message.answer("⏳ Скачивание...")
+
     try:
-        data = await asyncio.to_thread(download_audio, url)
-        apply_metadata(data['file_path'], data['title'], data['artist'], data['album'], data['cover_path'])
-        
-        await bot.send_audio(
-            chat_id=message.chat.id,
-            audio=types.FSInputFile(data['file_path']),
-            title=data['title'],
-            performer=data['artist']
+        data = await asyncio.to_thread(download_media, url)
+
+        await message.answer_audio(
+            audio=FSInputFile(data["file"]),
+            title=data["title"],
+            performer=data["uploader"],
         )
-        
-        if os.path.exists(data['file_path']):
-            os.remove(data['file_path'])
-        if data['cover_path'] and os.path.exists(data['cover_path']):
-            os.remove(data['cover_path'])
-            
-        await status_msg.delete()
+
+        if os.path.exists(data["file"]):
+            os.remove(data["file"])
+
+        await msg.delete()
+
     except Exception as e:
-        await status_msg.edit_text(f"❌ Ошибка: {e}")
+        logging.exception(e)
+        await msg.edit_text(f"❌ Ошибка:\n{e}")
 
 async def main():
     await dp.start_polling(bot)
