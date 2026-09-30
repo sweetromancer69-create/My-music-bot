@@ -22,10 +22,8 @@ dp = Dispatcher()
 
 def get_universal_metadata(url: str):
     """
-    Универсальный парсер: сначала пробует извлечь метаданные через yt-dlp,
-    а если сервис закрыт (как Qobuz/Beatport), подключает BeautifulSoup по og:title.
+    Универсальный парсер: сначала пробует yt-dlp, затем BeautifulSoup (Beatport, Qobuz, Apple Music, Deezer, Tidal, Amazon).
     """
-    # 1. Попытка через yt-dlp (отлично работает для Apple Music, Deezer, Amazon, Tidal)
     try:
         ydl_opts = {"extract_flat": True, "quiet": True}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -38,7 +36,6 @@ def get_universal_metadata(url: str):
     except Exception:
         pass
 
-    # 2. Универсальный резервный вариант через requests + BeautifulSoup (для всех остальных)
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -47,12 +44,10 @@ def get_universal_metadata(url: str):
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.text, "html.parser")
             
-            # Проверяем стандартные теги заголовков
             for prop in ["og:title", "twitter:title"]:
                 tag = soup.find("meta", property=prop) or soup.find("meta", attrs={"name": prop})
                 if tag and tag.get("content"):
                     full_text = tag["content"]
-                    # Очищаем от мусора популярных платформ
                     for suffix in [
                         " | Qobuz", " on Qobuz", " on Beatport", 
                         " - Apple Music", " - song and lyrics by", 
@@ -62,7 +57,6 @@ def get_universal_metadata(url: str):
                             full_text = full_text.split(suffix)[0]
                     return full_text, ""
             
-            # Если тегов нет, берем тег <title> страницы
             if soup.title and soup.title.string:
                 return soup.title.string.strip(), ""
                 
@@ -73,35 +67,40 @@ def get_universal_metadata(url: str):
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
+    print(f"DEBUG_LOG ---> Команда /start от User ID: {message.from_user.id}")
     if ADMIN_ID and message.from_user.id != int(ADMIN_ID):
+        print(f"DEBUG_LOG ---> Доступ запрещен для ID {message.from_user.id}")
         await message.answer("У вас нет доступа к этому боту.")
         return
 
     await message.answer(
-        "🎧 <b>Мульти-бот активен!</b>\n\n"
-        "Отправь мне ссылку на трек с любой поддерживаемой платформы:\n"
-        "• Beatport\n• Qobuz\n• Apple Music\n• Deezer\n• Tidal\n• Amazon Music\n\n"
+        "🎧 <b>Мульти-бот запущен!</b>\n\n"
+        "Отправь мне ссылку на трек с любой платформы:\n"
+        "• Beatport • Qobuz • Apple Music\n• Deezer • Tidal • Amazon Music\n\n"
         "Я найду аудио, оформлю теги и пришлю MP3 в высоком качестве.",
         parse_mode="HTML"
     )
 
 @dp.message(F.text)
 async def handle_music_link(message: types.Message):
+    print(f"DEBUG_LOG ---> Получено сообщение от User ID: {message.from_user.id} | Текст: {message.text}")
+
     if ADMIN_ID and message.from_user.id != int(ADMIN_ID):
+        print(f"DEBUG_LOG ---> Доступ отклонен! Ожидался ADMIN_ID={ADMIN_ID}, а пришел {message.from_user.id}")
         return
 
     url = message.text.strip()
-
     if not url.startswith(("http://", "https://")):
         await message.answer("Пожалуйста, отправь корректную ссылку.")
         return
 
     status_msg = await message.answer("🔍 Читаю ссылку и распознаю трек...")
+    print("DEBUG_LOG ---> Отправлен статус: Читаю ссылку...")
 
     temp_dir = tempfile.mkdtemp(prefix="music_bot_")
     try:
-        # 1. Извлекаем название и артиста
         track_title, track_artist = get_universal_metadata(url)
+        print(f"DEBUG_LOG ---> Распознано: Артист='{track_artist}' | Трек='{track_title}'")
 
         if not track_title:
             await status_msg.edit_text("Не удалось распознать трек по этой ссылке.")
@@ -110,7 +109,6 @@ async def handle_music_link(message: types.Message):
         search_query = f"{track_artist} - {track_title}" if track_artist else track_title
         await status_msg.edit_text(f"🎵 Найдено: <b>{search_query}</b>\n⏳ Ищу и скачиваю аудио...", parse_mode="HTML")
 
-        # 2. Скачиваем файл через поисковой механизм с обходом блокировок
         ydl_opts = {
             "format": "bestaudio/best",
             "outtmpl": os.path.join(temp_dir, "%(id)s.%(ext)s"),
@@ -130,6 +128,7 @@ async def handle_music_link(message: types.Message):
             ],
         }
 
+        print(f"DEBUG_LOG ---> Запуск поиска yt-dlp по запросу: {search_query}")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             search_target = f"ytsearch1:{search_query}"
             info = ydl.extract_info(search_target, download=True)
@@ -145,7 +144,7 @@ async def handle_music_link(message: types.Message):
                 raise RuntimeError("Не удалось сохранить аудио файл.")
             downloaded_file = candidates[0]
 
-        # 3. Записываем ID3-теги через mutagen
+        print(f"DEBUG_LOG ---> Аудио скачано, записываем теги...")
         try:
             audio = ID3(str(downloaded_file))
         except Exception:
@@ -157,7 +156,7 @@ async def handle_music_link(message: types.Message):
             audio["TPE1"] = TPE1(encoding=3, text=track_artist)
         audio.save(str(downloaded_file))
 
-        # 4. Отправляем готовый трек в Telegram
+        print(f"DEBUG_LOG ---> Отправка аудиофайла в Telegram...")
         audio_input = types.FSInputFile(str(downloaded_file))
         await message.answer_audio(
             audio_input,
@@ -165,9 +164,11 @@ async def handle_music_link(message: types.Message):
             performer=track_artist or "Music Release"
         )
         await status_msg.delete()
+        print(f"DEBUG_LOG ---> Трек успешно отправлен!")
 
     except Exception as e:
         logging.exception("Error processing link")
+        print(f"DEBUG_LOG ---> ОШИБКА: {str(e)}")
         await status_msg.edit_text(f"Произошла ошибка при обработке: {str(e)[:300]}")
 
     finally:
