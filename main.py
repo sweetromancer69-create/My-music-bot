@@ -13,7 +13,7 @@ from aiogram.filters import Command
 logging.basicConfig(level=logging.INFO)
 
 # ==================== НАСТРОЙКИ ====================
-BOT_TOKEN = "8881412253:AAELisPKS06kE8kIUG2kXZLfo-Jc8wHBMjk"
+BOT_TOKEN = "8881412253:AAEkh5q7GYr8AB1Wk3z9lwQ9fn2dRjI3zyI"
 ADMIN_ID = 96349161
 # ===================================================
 
