@@ -12,10 +12,10 @@ from aiogram.filters import Command
 
 logging.basicConfig(level=logging.INFO)
 
-# ==================== НАСТРОЙКИ ====================
-BOT_TOKEN = "8881412253:AAEUfdKH8VKEWPCXKk4AK8zH_p27Odi3278"
-ADMIN_ID = 963491961
-# ===================================================
+# ==================== НАСТРОЙКИ ИЗ ОКРУЖЕНИЯ ====================
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "963491961"))
+# ===============================================================
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -68,7 +68,7 @@ def get_universal_metadata(url: str):
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     print(f"DEBUG_LOG ---> Команда /start от User ID: {message.from_user.id}")
-    if ADMIN_ID and message.from_user.id != int(ADMIN_ID):
+    if ADMIN_ID and message.from_user.id != ADMIN_ID:
         print(f"DEBUG_LOG ---> Доступ запрещен для ID {message.from_user.id}")
         await message.answer("У вас нет доступа к этому боту.")
         return
@@ -84,7 +84,7 @@ async def cmd_start(message: types.Message):
 async def handle_music_link(message: types.Message):
     print(f"DEBUG_LOG ---> Получено сообщение от User ID: {message.from_user.id} | Текст: {message.text}")
 
-    if ADMIN_ID and message.from_user.id != int(ADMIN_ID):
+    if ADMIN_ID and message.from_user.id != ADMIN_ID:
         print(f"DEBUG_LOG ---> Доступ отклонен! Ожидался ADMIN_ID={ADMIN_ID}, а пришел {message.from_user.id}")
         return
 
@@ -102,7 +102,6 @@ async def handle_music_link(message: types.Message):
         print(f"DEBUG_LOG ---> Распознано: Артист='{track_artist}' | Трек='{track_title}'")
 
         if not track_title:
-            # Если метатеги сайта не отдали название, попробуем использовать саму ссылку как запрос для трека
             track_title = url
 
         search_query = f"{track_artist} - {track_title}" if track_artist else track_title
@@ -127,11 +126,10 @@ async def handle_music_link(message: types.Message):
             ],
         }
 
-        # Каскадный поиск по альтернативным музыкальным каталогам (без YouTube)
         search_providers = [
-            f"scsearch1:{search_query}",       # 1. SoundCloud (отлично для клубной музыки и ремиксов)
-            f"bandcampsearch1:{search_query}", # 2. Bandcamp (качественный андеграунд)
-            f"vksearch1:{search_query}"        # 3. VK (резервный источник)
+            f"scsearch1:{search_query}",       # 1. SoundCloud
+            f"bandcampsearch1:{search_query}", # 2. Bandcamp
+            f"vksearch1:{search_query}"        # 3. VK
         ]
 
         print(f"DEBUG_LOG ---> Запуск каскадного поиска для: {search_query}")
@@ -163,7 +161,7 @@ async def handle_music_link(message: types.Message):
         if not downloaded_file or not downloaded_file.exists():
             candidates = list(Path(temp_dir).glob("*.mp3"))
             if not candidates:
-                raise RuntimeError("Трек не найден ни на одной из альтернативных платформ (SoundCloud, Bandcamp, VK).")
+                raise RuntimeError("Трек не найден ни на одной из альтернативных платформ.")
             downloaded_file = candidates[0]
 
         print(f"DEBUG_LOG ---> Аудио скачано, записываем теги...")
