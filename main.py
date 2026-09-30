@@ -109,13 +109,11 @@ async def handle_music_link(message: types.Message):
 
         ydl_opts = {
             "format": "bestaudio/best",
-            "outtmpl": os.path.join(temp_dir, "%(id)s.%(ext)s"),
+            "outtmpl": os.path.join(temp_dir, "%(title)s.%(ext)s"),
             "noplaylist": True,
             "quiet": True,
             "http_headers": {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-us,en;q=0.5",
             },
             "postprocessors": [
                 {
@@ -126,6 +124,7 @@ async def handle_music_link(message: types.Message):
             ],
         }
 
+        # Каскадный поиск по альтернативным каталогам (без YouTube)
         search_providers = [
             f"scsearch1:{search_query}",       # 1. SoundCloud
             f"bandcampsearch1:{search_query}", # 2. Bandcamp
@@ -150,9 +149,14 @@ async def handle_music_link(message: types.Message):
                             info = res
                         
                         if info:
-                            downloaded_file = Path(ydl.prepare_filename(info)).with_suffix(".mp3")
+                            filename = ydl.prepare_filename(info)
+                            downloaded_file = Path(filename).with_suffix(".mp3")
                             if downloaded_file.exists():
                                 print(f"DEBUG_LOG ---> Успешно найдено и скачано через {search_target}")
+                                if not track_title or track_title == url:
+                                    track_title = info.get("title", "Unknown Track")
+                                if not track_artist:
+                                    track_artist = info.get("uploader", "Musicvibez")
                                 break
                 except Exception as e:
                     print(f"DEBUG_LOG ---> Платформа {search_target} не дала результатов: {e}")
@@ -164,24 +168,22 @@ async def handle_music_link(message: types.Message):
                 raise RuntimeError("Трек не найден ни на одной из альтернативных платформ.")
             downloaded_file = candidates[0]
 
-        print(f"DEBUG_LOG ---> Аудио скачано, записываем теги...")
+        print(f"DEBUG_LOG ---> Записываем теги: Артист='{track_artist}', Трек='{track_title}'")
         try:
             audio = ID3(str(downloaded_file))
         except Exception:
             audio = ID3()
             
-        if track_title:
-            audio["TIT2"] = TIT2(encoding=3, text=track_title)
-        if track_artist:
-            audio["TPE1"] = TPE1(encoding=3, text=track_artist)
+        audio["TIT2"] = TIT2(encoding=3, text=track_title or "Unknown Track")
+        audio["TPE1"] = TPE1(encoding=3, text=track_artist or "Musicvibez")
         audio.save(str(downloaded_file))
 
         print(f"DEBUG_LOG ---> Отправка аудиофайла в Telegram...")
         audio_input = types.FSInputFile(str(downloaded_file))
         await message.answer_audio(
             audio_input,
-            title=track_title,
-            performer=track_artist or "Musicvibez Release"
+            title=track_title or "Track",
+            performer=track_artist or "Musicvibez.org"
         )
         await status_msg.delete()
         print(f"DEBUG_LOG ---> Трек успешно отправлен!")
