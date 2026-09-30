@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 import tempfile
+import json
 from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
@@ -22,20 +23,8 @@ dp = Dispatcher()
 
 def get_universal_metadata(url: str):
     """
-    Универсальный парсер: сначала пробует yt-dlp, затем BeautifulSoup для извлечения названия и автора.
+    Продвинутый парсер для Beatport и других платформ: извлекает чистые метаданные.
     """
-    try:
-        ydl_opts = {"extract_flat": True, "quiet": True}
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if info:
-                title = info.get("title")
-                uploader = info.get("uploader") or info.get("artist")
-                if title:
-                    return title, uploader or ""
-    except Exception:
-        pass
-
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -44,6 +33,28 @@ def get_universal_metadata(url: str):
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.text, "html.parser")
             
+            # Проверяем JSON-данные Beatport (__NEXT_DATA__)
+            next_data = soup.find("script", id="__NEXT_DATA__")
+            if next_data:
+                try:
+                    data = json.loads(next_data.string)
+                    # Пытаемся вытащить данные трека из кэша Apollo / структуры страницы Beatport
+                    queries = data.get("props", {}).get("pageProps", {}).get("dehydratedState", {}).get("queries", [])
+                    for q in queries:
+                        state_data = q.get("state", {}).get("data", {})
+                        if "track" in state_data:
+                            track_info = state_data["track"]
+                            title = track_info.get("name")
+                            mix = track_info.get("mix_name")
+                            if mix and mix != "Original Mix":
+                                title = f"{title} ({mix})"
+                            artists = ", ".join([a["name"] for a in track_info.get("artists", [])])
+                            if title and artists:
+                                return title, artists
+                except Exception:
+                    pass
+
+            # Запасной вариант через Open Graph теги
             for prop in ["og:title", "twitter:title"]:
                 tag = soup.find("meta", property=prop) or soup.find("meta", attrs={"name": prop})
                 if tag and tag.get("content"):
@@ -55,13 +66,18 @@ def get_universal_metadata(url: str):
                     ]:
                         if suffix in full_text:
                             full_text = full_text.split(suffix)[0]
-                    return full_text, ""
+                    
+                    # Если формат "Трек - Артист" или наоборот
+                    parts = full_text.split(" - ")
+                    if len(parts) >= 2:
+                        return parts[0].strip(), parts[1].strip()
+                    return full_text.strip(), ""
             
             if soup.title and soup.title.string:
                 return soup.title.string.strip(), ""
                 
     except Exception as e:
-        logging.error(f"Ошибка универсального парсинга: {e}")
+        logging.error(f"Ошибка парсинга метаданных: {e}")
 
     return None, None
 
@@ -76,7 +92,7 @@ async def cmd_start(message: types.Message):
     await message.answer(
         "🎧 <b>Мульти-бот запущен!</b>\n\n"
         "Отправь мне ссылку на трек (Beatport, SoundCloud, Qobuz, Apple Music и др.):\n\n"
-        "Я найду аудио на альтернативных площадках, оформлю теги и пришлю MP3 (320kbps).",
+        "Я найду аудио на альтернативных площадках (без YouTube), оформлю теги и пришлю MP3 (320kbps).",
         parse_mode="HTML"
     )
 
@@ -93,7 +109,7 @@ async def handle_music_link(message: types.Message):
         await message.answer("Пожалуйста, отправь корректную ссылку.")
         return
 
-    status_msg = await message.answer("🔍 Читаю ссылку и распознаю трек...")
+    status_msg = await message.answer("🔍 Читаю страницу релизов...")
     print("DEBUG_LOG ---> Отправлен статус: Читаю ссылку...")
 
     temp_dir = tempfile.mkdtemp(prefix="music_bot_")
@@ -105,9 +121,14 @@ async def handle_music_link(message: types.Message):
             track_title = url
 
         search_query = f"{track_artist} - {track_title}" if track_artist else track_title
-        await status_msg.edit_text(f"🎵 Найдено: <b>{search_query}</b>\n⏳ Ищу и скачиваю аудио...", parse_mode="HTML")
+        
+        # Очищаем запрос от лишней разметки
+        search_query = search_query.replace(" - - ", " - ").strip()
+        if len(search_query) > 80:
+            search_query = search_query[:80].strip()
 
-        # Используем статичное короткое имя файла внутри уникальной папки, чтобы избегать ошибок длины путей
+        await status_msg.edit_text(f"🎵 Ищу в каталогах: <b>{search_query}</b>\n⏳ Скачиваем аудио...", parse_mode="HTML")
+
         ydl_opts = {
             "format": "bestaudio/best",
             "outtmpl": os.path.join(temp_dir, "audio.%(ext)s"),
@@ -125,10 +146,11 @@ async def handle_music_link(message: types.Message):
             ],
         }
 
+        # Каскадный поиск ИСКЛЮЧИТЕЛЬНО по музыкальным платформам (без YouTube)
         search_providers = [
-            f"scsearch1:{search_query}",       # 1. SoundCloud
-            f"bandcampsearch1:{search_query}", # 2. Bandcamp
-            f"vksearch1:{search_query}"        # 3. VK
+            f"scsearch1:{search_query}",       # 1. SoundCloud (основной склад клубной музыки и ремиксов)
+            f"bandcampsearch1:{search_query}", # 2. Bandcamp (высокое качество релизов)
+            f"vksearch1:{search_query}"        # 3. VK Музыка (резерв)
         ]
 
         print(f"DEBUG_LOG ---> Запуск каскадного поиска для: {search_query}")
@@ -149,15 +171,10 @@ async def handle_music_link(message: types.Message):
                             info = res
                         
                         if info:
-                            # Проверяем появление файла audio.mp3
                             potential_file = Path(temp_dir) / "audio.mp3"
                             if potential_file.exists():
                                 downloaded_file = potential_file
                                 print(f"DEBUG_LOG ---> Успешно найдено и скачано через {search_target}")
-                                if not track_title or track_title == url:
-                                    track_title = info.get("title", "Unknown Track")
-                                if not track_artist:
-                                    track_artist = info.get("uploader", "Musicvibez")
                                 break
                 except Exception as e:
                     print(f"DEBUG_LOG ---> Платформа {search_target} не дала результатов: {e}")
@@ -166,7 +183,7 @@ async def handle_music_link(message: types.Message):
         if not downloaded_file or not downloaded_file.exists():
             candidates = list(Path(temp_dir).glob("*.mp3"))
             if not candidates:
-                raise RuntimeError("Трек не найден ни на одной из альтернативных платформ.")
+                raise RuntimeError("Трек не найден на музыкальных платформах (SoundCloud, Bandcamp, VK).")
             downloaded_file = candidates[0]
 
         print(f"DEBUG_LOG ---> Записываем теги: Артист='{track_artist}', Трек='{track_title}'")
