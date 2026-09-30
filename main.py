@@ -107,9 +107,10 @@ async def handle_music_link(message: types.Message):
         search_query = f"{track_artist} - {track_title}" if track_artist else track_title
         await status_msg.edit_text(f"🎵 Найдено: <b>{search_query}</b>\n⏳ Ищу и скачиваю аудио...", parse_mode="HTML")
 
+        # Используем безопасно короткое имя файла на диске по ID, чтобы избегать длинных путей
         ydl_opts = {
             "format": "bestaudio/best",
-            "outtmpl": os.path.join(temp_dir, "%(title)s.%(ext)s"),
+            "outtmpl": os.path.join(temp_dir, "%(id)s.%(ext)s"),
             "noplaylist": True,
             "quiet": True,
             "http_headers": {
