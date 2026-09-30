@@ -107,10 +107,10 @@ async def handle_music_link(message: types.Message):
         search_query = f"{track_artist} - {track_title}" if track_artist else track_title
         await status_msg.edit_text(f"🎵 Найдено: <b>{search_query}</b>\n⏳ Ищу и скачиваю аудио...", parse_mode="HTML")
 
-        # Используем безопасно короткое имя файла на диске по ID, чтобы избегать длинных путей
+        # Используем статичное короткое имя файла внутри уникальной папки, чтобы избегать ошибок длины путей
         ydl_opts = {
             "format": "bestaudio/best",
-            "outtmpl": os.path.join(temp_dir, "%(id)s.%(ext)s"),
+            "outtmpl": os.path.join(temp_dir, "audio.%(ext)s"),
             "noplaylist": True,
             "quiet": True,
             "http_headers": {
@@ -125,7 +125,6 @@ async def handle_music_link(message: types.Message):
             ],
         }
 
-        # Каскадный поиск по альтернативным каталогам (без YouTube)
         search_providers = [
             f"scsearch1:{search_query}",       # 1. SoundCloud
             f"bandcampsearch1:{search_query}", # 2. Bandcamp
@@ -150,9 +149,10 @@ async def handle_music_link(message: types.Message):
                             info = res
                         
                         if info:
-                            filename = ydl.prepare_filename(info)
-                            downloaded_file = Path(filename).with_suffix(".mp3")
-                            if downloaded_file.exists():
+                            # Проверяем появление файла audio.mp3
+                            potential_file = Path(temp_dir) / "audio.mp3"
+                            if potential_file.exists():
+                                downloaded_file = potential_file
                                 print(f"DEBUG_LOG ---> Успешно найдено и скачано через {search_target}")
                                 if not track_title or track_title == url:
                                     track_title = info.get("title", "Unknown Track")
