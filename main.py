@@ -13,7 +13,7 @@ from aiogram.filters import Command
 logging.basicConfig(level=logging.INFO)
 
 # ==================== НАСТРОЙКИ ====================
-BOT_TOKEN = "8881412253:AAEkh5q7GYr8AB1Wk3z9lwQ9fn2dRjI3zyI"
+BOT_TOKEN = "8881412253:AAELisPKS06kE8kIUG2kXZLfo-Jc8wHBMjk"
 ADMIN_ID = 963491961
 # ===================================================
 
@@ -22,7 +22,7 @@ dp = Dispatcher()
 
 def get_universal_metadata(url: str):
     """
-    Универсальный парсер: сначала пробует yt-dlp, затем BeautifulSoup (Beatport, Qobuz, Apple Music, Deezer, Tidal, Amazon).
+    Универсальный парсер: сначала пробует yt-dlp, затем BeautifulSoup для извлечения названия и автора.
     """
     try:
         ydl_opts = {"extract_flat": True, "quiet": True}
@@ -51,7 +51,7 @@ def get_universal_metadata(url: str):
                     for suffix in [
                         " | Qobuz", " on Qobuz", " on Beatport", 
                         " - Apple Music", " - song and lyrics by", 
-                        " | Deezer", " | Tidal", " | Amazon Music"
+                        " | Deezer", " | Tidal", " | Amazon Music", " | SoundCloud"
                     ]:
                         if suffix in full_text:
                             full_text = full_text.split(suffix)[0]
@@ -75,9 +75,8 @@ async def cmd_start(message: types.Message):
 
     await message.answer(
         "🎧 <b>Мульти-бот запущен!</b>\n\n"
-        "Отправь мне ссылку на трек с любой платформы:\n"
-        "• Beatport • Qobuz • Apple Music\n• Deezer • Tidal • Amazon Music\n\n"
-        "Я найду аудио, оформлю теги и пришлю MP3 в высоком качестве.",
+        "Отправь мне ссылку на трек (Beatport, SoundCloud, Qobuz, Apple Music и др.):\n\n"
+        "Я найду аудио на альтернативных площадках, оформлю теги и пришлю MP3 (320kbps).",
         parse_mode="HTML"
     )
 
@@ -103,8 +102,8 @@ async def handle_music_link(message: types.Message):
         print(f"DEBUG_LOG ---> Распознано: Артист='{track_artist}' | Трек='{track_title}'")
 
         if not track_title:
-            await status_msg.edit_text("Не удалось распознать трек по этой ссылке.")
-            return
+            # Если метатеги сайта не отдали название, попробуем использовать саму ссылку как запрос для трека
+            track_title = url
 
         search_query = f"{track_artist} - {track_title}" if track_artist else track_title
         await status_msg.edit_text(f"🎵 Найдено: <b>{search_query}</b>\n⏳ Ищу и скачиваю аудио...", parse_mode="HTML")
@@ -128,20 +127,43 @@ async def handle_music_link(message: types.Message):
             ],
         }
 
-        print(f"DEBUG_LOG ---> Запуск поиска yt-dlp по запросу: {search_query}")
+        # Каскадный поиск по альтернативным музыкальным каталогам (без YouTube)
+        search_providers = [
+            f"scsearch1:{search_query}",       # 1. SoundCloud (отлично для клубной музыки и ремиксов)
+            f"bandcampsearch1:{search_query}", # 2. Bandcamp (качественный андеграунд)
+            f"vksearch1:{search_query}"        # 3. VK (резервный источник)
+        ]
+
+        print(f"DEBUG_LOG ---> Запуск каскадного поиска для: {search_query}")
+        
+        info = None
+        downloaded_file = None
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            search_target = f"ytsearch1:{search_query}"
-            info = ydl.extract_info(search_target, download=True)
-            
-            if "entries" in info:
-                info = info["entries"][0]
+            for search_target in search_providers:
+                try:
+                    print(f"DEBUG_LOG ---> Пробую найти через: {search_target}")
+                    res = ydl.extract_info(search_target, download=True)
+                    
+                    if res:
+                        if "entries" in res and len(res["entries"]) > 0:
+                            info = res["entries"][0]
+                        else:
+                            info = res
+                        
+                        if info:
+                            downloaded_file = Path(ydl.prepare_filename(info)).with_suffix(".mp3")
+                            if downloaded_file.exists():
+                                print(f"DEBUG_LOG ---> Успешно найдено и скачано через {search_target}")
+                                break
+                except Exception as e:
+                    print(f"DEBUG_LOG ---> Платформа {search_target} не дала результатов: {e}")
+                    continue
 
-            downloaded_file = Path(ydl.prepare_filename(info)).with_suffix(".mp3")
-
-        if not downloaded_file.exists():
+        if not downloaded_file or not downloaded_file.exists():
             candidates = list(Path(temp_dir).glob("*.mp3"))
             if not candidates:
-                raise RuntimeError("Не удалось сохранить аудио файл.")
+                raise RuntimeError("Трек не найден ни на одной из альтернативных платформ (SoundCloud, Bandcamp, VK).")
             downloaded_file = candidates[0]
 
         print(f"DEBUG_LOG ---> Аудио скачано, записываем теги...")
@@ -161,7 +183,7 @@ async def handle_music_link(message: types.Message):
         await message.answer_audio(
             audio_input,
             title=track_title,
-            performer=track_artist or "Music Release"
+            performer=track_artist or "Musicvibez Release"
         )
         await status_msg.delete()
         print(f"DEBUG_LOG ---> Трек успешно отправлен!")
