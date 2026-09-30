@@ -14,7 +14,7 @@ logging.basicConfig(level=logging.INFO)
 
 # ==================== НАСТРОЙКИ ====================
 BOT_TOKEN = "8881412253:AAEkh5q7GYr8AB1Wk3z9lwQ9fn2dRjI3zyI"
-ADMIN_ID = 96349161
+ADMIN_ID = 963491961
 # ===================================================
 
 bot = Bot(token=BOT_TOKEN)
