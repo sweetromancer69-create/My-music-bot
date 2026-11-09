@@ -1,6 +1,6 @@
-aiogram
-yt-dlp
-aiohttp
-mutagen
-requests
-beautifulsoup4
+
+aiogram>=3.4.1
+requests>=2.31.0
+beautifulsoup4>=4.12.3
+yt-dlp>=2024.10.22
+mutagen>=1.47.0
