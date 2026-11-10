@@ -811,7 +811,7 @@ async def main():
     await start_healthcheck_server()
     await bot.delete_webhook(drop_pending_updates=True)
     logger.info("Бот успешно запущен и слушает сообщения!")
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 
 
 if __name__ == "__main__":
