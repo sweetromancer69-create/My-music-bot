@@ -41,6 +41,7 @@ HEADERS = {
 
 AM_CONSUMER_KEY = "audiomack-web"
 AM_CONSUMER_SECRET = "bd8a07e9f23fbe9d808646b730f89b8e"
+_SC_CLIENT_ID_CACHE = {"id": "", "ts": 0}
 
 
 def clean_beatport_title(raw_text: str):
@@ -88,14 +89,12 @@ def parse_beatport(url: str) -> dict:
         if resp.ok:
             soup = BeautifulSoup(resp.text, "html.parser")
 
-            # 1. Точное извлечение из __NEXT_DATA__ (pageProps.track или dehydratedState)
             next_script = soup.find("script", id="__NEXT_DATA__")
             if next_script and next_script.string:
                 try:
                     data = json.loads(next_script.string)
                     page_props = data.get("props", {}).get("pageProps", {})
 
-                    # Вариант А: напрямую в pageProps.track (актуальная структура Beatport)
                     t_info = page_props.get("track")
                     if not isinstance(t_info, dict):
                         t_info = None
@@ -157,7 +156,6 @@ def parse_beatport(url: str) -> dict:
                 except Exception as ex:
                     logger.warning(f"Error parsing Beatport __NEXT_DATA__: {ex}")
 
-            # 2. Резервный парсинг через og:title и og:image
             og_title = soup.find("meta", property="og:title") or soup.find("meta", attrs={"name": "og:title"})
             if og_title and og_title.get("content"):
                 parsed_artist, parsed_title, parsed_label = clean_beatport_title(og_title["content"])
@@ -176,6 +174,123 @@ def parse_beatport(url: str) -> dict:
         logger.warning(f"Beatport parse error: {e}")
 
     return meta
+
+
+def normalize_for_match(s: str) -> str:
+    s = re.sub(r"\([^\)]*\)|\[[^\]]*\]", "", (s or "").lower())
+    s = re.sub(r"[^a-z0-9а-яё\s]", " ", s)
+    return " ".join(s.split())
+
+
+def get_soundcloud_client_id() -> str:
+    now = time.time()
+    if _SC_CLIENT_ID_CACHE["id"] and (now - _SC_CLIENT_ID_CACHE["ts"] < 3600):
+        return _SC_CLIENT_ID_CACHE["id"]
+    try:
+        r = requests.get("https://soundcloud.com", headers=HEADERS, timeout=8)
+        scripts = re.findall(r'src="(https://a-v2\.sndcdn\.com/assets/[^"]+\.js)"', r.text)
+        for s_url in scripts[-6:]:
+            jr = requests.get(s_url, headers=HEADERS, timeout=8)
+            m = re.search(r'client_id:"([a-zA-Z0-9]{32})"', jr.text)
+            if m:
+                _SC_CLIENT_ID_CACHE["id"] = m.group(1)
+                _SC_CLIENT_ID_CACHE["ts"] = now
+                return m.group(1)
+    except Exception as e:
+        logger.warning(f"Failed to fetch SoundCloud client_id: {e}")
+    return _SC_CLIENT_ID_CACHE["id"]
+
+
+def download_from_soundcloud_api(artist: str, title: str, mix: str, label: str, tmp_dir: str) -> str:
+    """
+    Прямое скачивание через SoundCloud API v2 (AAC 160k / MP3 + конвертация в 320k MP3 за 4-7 сек).
+    Проверяет точное совпадение артиста/лейбла и названия, отсекая часовые радиошоу и 30-сек превью.
+    """
+    cid = get_soundcloud_client_id()
+    if not cid:
+        return ""
+
+    base_title = normalize_for_match(title)
+    first_artist = normalize_for_match(artist.split(",")[0])
+    base_label = normalize_for_match(label)
+
+    queries = [f"{artist} {title}".strip()]
+    if mix and mix.lower() not in title.lower() and mix.lower() != "original mix":
+        queries.insert(0, f"{artist} {title} {mix}".strip())
+    if label:
+        queries.append(f"{label} {artist} {title}".strip())
+
+    for q in queries:
+        try:
+            sr = requests.get(
+                "https://api-v2.soundcloud.com/search/tracks",
+                params={"q": q, "client_id": cid, "limit": 8},
+                headers=HEADERS,
+                timeout=8,
+            )
+            if not sr.ok:
+                continue
+            collection = sr.json().get("collection") or []
+            for track in collection:
+                dur_sec = int(track.get("duration") or 0) // 1000
+                # Отсекаем короткие 30-сек сниппеты и длинные DJ-сеты (> 15 мин)
+                if dur_sec < 60 or dur_sec > 900:
+                    continue
+
+                t_title = normalize_for_match(track.get("title") or "")
+                t_user = normalize_for_match((track.get("user") or {}).get("username") or "")
+                t_slug = normalize_for_match((track.get("permalink_url") or "").replace("-", " "))
+                combined_haystack = f"{t_title} {t_user} {t_slug}"
+
+                # Проверяем наличие названия трека И (артиста ИЛИ лейбла)
+                if base_title and base_title not in combined_haystack:
+                    continue
+                if first_artist and first_artist not in combined_haystack:
+                    if not (base_label and base_label in combined_haystack):
+                        continue
+
+                transcodings = (track.get("media") or {}).get("transcodings") or []
+                auth = track.get("track_authorization") or ""
+                stream_m3u8_or_mp3 = ""
+
+                # Сначала пробуем progressive или aac_160k
+                for tr in transcodings:
+                    tr_url = tr.get("url")
+                    if not tr_url:
+                        continue
+                    try:
+                        tr_resp = requests.get(
+                            tr_url,
+                            params={"client_id": cid, "track_authorization": auth},
+                            headers={**HEADERS, "Referer": "https://soundcloud.com/"},
+                            timeout=6,
+                        )
+                        if tr_resp.ok:
+                            candidate_url = tr_resp.json().get("url")
+                            if candidate_url:
+                                stream_m3u8_or_mp3 = candidate_url
+                                break
+                    except Exception:
+                        continue
+
+                if not stream_m3u8_or_mp3:
+                    continue
+
+                logger.info(f"SoundCloud API v2 matched: {track.get('title')} ({dur_sec}s)")
+                out_mp3_path = os.path.join(tmp_dir, "audio.mp3")
+                cmd = [
+                    "ffmpeg", "-y", "-i", stream_m3u8_or_mp3,
+                    "-vn", "-ar", "44100", "-ac", "2", "-b:a", "320k",
+                    out_mp3_path,
+                ]
+                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=35, check=True)
+                if os.path.exists(out_mp3_path) and os.path.getsize(out_mp3_path) > 100000:
+                    return out_mp3_path
+        except Exception as e:
+            logger.warning(f"SoundCloud API v2 error for '{q}': {e}")
+            continue
+
+    return ""
 
 
 def audiomack_api_get(path: str, params: dict = None) -> dict:
@@ -204,18 +319,13 @@ def audiomack_api_get(path: str, params: dict = None) -> dict:
     return r.json()
 
 
-def normalize_for_match(s: str) -> str:
-    s = re.sub(r"\([^\)]*\)|\[[^\]]*\]", "", s.lower())
-    s = re.sub(r"[^a-z0-9а-яё\s]", " ", s)
-    return " ".join(s.split())
-
-
 def download_from_audiomack(artist: str, title: str, mix: str, tmp_dir: str) -> str:
     """
     Быстрый поиск и скачивание HQ-потока напрямую с серверов Audiomack (1-2 сек, без блокировок IP).
+    Строго проверяет совпадение И артиста, И названия трека.
     """
     base_title = normalize_for_match(title)
-    base_artist = normalize_for_match(artist.split(",")[0])
+    first_artist = normalize_for_match(artist.split(",")[0])
 
     queries = [f"{artist} {title}".strip()]
     if mix and mix.lower() not in title.lower() and mix.lower() != "original mix":
@@ -227,13 +337,17 @@ def download_from_audiomack(artist: str, title: str, mix: str, tmp_dir: str) -> 
             results = search_res.get("results") or []
             for item in results:
                 item_title = normalize_for_match(str(item.get("title") or ""))
-                item_artist = normalize_for_match(str(item.get("artist") or item.get("uploader", {}).get("name") or ""))
+                item_artist = normalize_for_match(
+                    str(item.get("artist") or (item.get("uploader") or {}).get("name") or "")
+                )
                 duration = int(item.get("duration") or 0)
 
-                # Проверяем совпадение названия трека и длительность (>= 60 сек)
+                # Строгая проверка: должны совпадать И название трека, И имя артиста!
                 if base_title and base_title not in item_title and item_title not in base_title:
                     continue
-                if duration > 0 and duration < 60:
+                if first_artist and first_artist not in item_artist and first_artist not in item_title:
+                    continue
+                if duration > 0 and (duration < 60 or duration > 900):
                     continue
 
                 song_id = item.get("id")
@@ -259,7 +373,6 @@ def download_from_audiomack(artist: str, title: str, mix: str, tmp_dir: str) -> 
                             if chunk:
                                 f.write(chunk)
 
-                # Конвертируем в 320 kbps MP3 через ffmpeg
                 cmd = [
                     "ffmpeg", "-y", "-i", raw_audio_path,
                     "-vn", "-ar", "44100", "-ac", "2", "-b:a", "320k",
@@ -276,19 +389,22 @@ def download_from_audiomack(artist: str, title: str, mix: str, tmp_dir: str) -> 
 
 
 def find_bandcamp_track_url(artist: str, title: str) -> str:
-    """Ищет прямую ссылку на трек в Bandcamp"""
     try:
         q = urllib.parse.quote(f"{artist} {title}".strip())
         r = requests.get(f"https://bandcamp.com/search?q={q}&item_type=t", headers=HEADERS, timeout=8)
         if r.ok:
             soup = BeautifulSoup(r.text, "html.parser")
             base_title = normalize_for_match(title)
+            first_artist = normalize_for_match(artist.split(",")[0])
             for res_el in soup.select(".searchresult.track"):
                 heading = res_el.select_one(".heading a")
+                subhead = res_el.select_one(".subhead")
                 if heading and heading.get("href"):
                     t_name = normalize_for_match(heading.get_text(strip=True))
-                    if not base_title or base_title in t_name or t_name in base_title:
-                        return heading["href"].split("?")[0]
+                    sub_txt = normalize_for_match(subhead.get_text(strip=True) if subhead else "")
+                    if base_title and base_title in t_name:
+                        if not first_artist or first_artist in sub_txt or first_artist in t_name:
+                            return heading["href"].split("?")[0]
     except Exception as e:
         logger.warning(f"Bandcamp search warning: {e}")
     return ""
@@ -338,8 +454,8 @@ def search_and_download(url: str, meta: dict, tmp_dir: str):
     artist = meta.get("artist", "").strip()
     title = meta.get("title", "").strip()
     mix = meta.get("mix", "").strip()
+    label = meta.get("label", "").strip()
 
-    # Скачиваем обложку заранее (для вшивания в MP3 и превью в Telegram)
     cover_bytes = None
     cover_path = None
     if meta.get("cover_url"):
@@ -353,14 +469,21 @@ def search_and_download(url: str, meta: dict, tmp_dir: str):
         except Exception:
             pass
 
-    # 1. Каскад 1: Audiomack HQ API (мгновенное скачивание за 1.5 сек без блокировок IP)
+    # 1. Каскад 1: Прямой Audiomack HQ API (1.2 сек, без блокировок)
     if artist or title:
         am_mp3 = download_from_audiomack(artist, title, mix, tmp_dir)
         if am_mp3 and os.path.exists(am_mp3):
             embed_tags(am_mp3, meta, cover_bytes)
             return am_mp3, cover_path
 
-    # 2. Каскад 2: SoundCloud (с проверкой совпадения названия трека) + Bandcamp + YouTube
+    # 2. Каскад 2: Прямой SoundCloud API v2 (4-6 сек, поддержка Beatport Exclusives и лейблов)
+    if artist or title:
+        sc_mp3 = download_from_soundcloud_api(artist, title, mix, label, tmp_dir)
+        if sc_mp3 and os.path.exists(sc_mp3):
+            embed_tags(sc_mp3, meta, cover_bytes)
+            return sc_mp3, cover_path
+
+    # 3. Каскад 3: Bandcamp или прямая ссылка через yt-dlp
     out_tmpl = os.path.join(tmp_dir, "audio.%(ext)s")
     ydl_opts = {
         "format": "bestaudio/best",
@@ -368,8 +491,8 @@ def search_and_download(url: str, meta: dict, tmp_dir: str):
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "socket_timeout": 12,
-        "retries": 2,
+        "socket_timeout": 10,
+        "retries": 1,
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
@@ -379,54 +502,22 @@ def search_and_download(url: str, meta: dict, tmp_dir: str):
         ],
     }
 
-    # Если пользователь прислал прямую ссылку на SoundCloud / Bandcamp / Audiomack
+    targets = []
     if any(d in url.lower() for d in ("soundcloud.com", "bandcamp.com", "audiomack.com")):
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.extract_info(url, download=True)
-        except Exception as e:
-            logger.warning(f"Direct download error: {e}")
+        targets.append(url)
+    bc_url = find_bandcamp_track_url(artist, title)
+    if bc_url:
+        targets.append(bc_url)
 
-    candidates = list(Path(tmp_dir).glob("*.mp3"))
-    if not candidates:
-        base_title = normalize_for_match(title)
-        clean_q = f"{artist} {title}".strip()
-        mix_q = f"{artist} {title} {mix}".strip() if mix and mix.lower() != "original mix" else clean_q
-
-        # Проверяем топ-5 результатов SoundCloud, чтобы скачать именно этот трек, а не другой трек артиста
+    if targets:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            for sc_q in ([mix_q, clean_q] if mix_q != clean_q else [clean_q]):
+            for t in targets:
                 try:
-                    sc_info = ydl.extract_info(f"scsearch5:{sc_q}", download=False)
-                    entries = sc_info.get("entries") or []
-                    for entry in entries:
-                        if not entry:
-                            continue
-                        e_title = normalize_for_match(entry.get("title") or "")
-                        e_dur = int(entry.get("duration") or 0)
-                        if base_title and base_title in e_title and e_dur >= 60:
-                            ep_url = entry.get("webpage_url") or entry.get("url")
-                            if ep_url:
-                                logger.info(f"SoundCloud verified match: {entry.get('title')} ({e_dur}s)")
-                                ydl.extract_info(ep_url, download=True)
-                                break
+                    ydl.extract_info(t, download=True)
                     if list(Path(tmp_dir).glob("*.mp3")):
                         break
                 except Exception as e:
-                    logger.warning(f"SoundCloud search warning: {e}")
-
-            # Если не нашли в SoundCloud — пробуем Bandcamp и YouTube
-            if not list(Path(tmp_dir).glob("*.mp3")):
-                bc_url = find_bandcamp_track_url(artist, title)
-                fallback_targets = ([bc_url] if bc_url else []) + [f"ytsearch1:{mix_q}"]
-                for target in fallback_targets:
-                    try:
-                        logger.info(f"Trying fallback target: {target}")
-                        ydl.extract_info(target, download=True)
-                        if list(Path(tmp_dir).glob("*.mp3")):
-                            break
-                    except Exception as e:
-                        logger.warning(f"Fallback {target} failed: {e}")
+                    logger.warning(f"Fallback {t} failed: {e}")
 
     candidates = list(Path(tmp_dir).glob("*.mp3"))
     if candidates:
@@ -434,7 +525,7 @@ def search_and_download(url: str, meta: dict, tmp_dir: str):
         embed_tags(final_file, meta, cover_bytes)
         return final_file, cover_path
 
-    raise RuntimeError(f"Трек «{artist} – {title}» не найден в открытых каталогах.")
+    raise RuntimeError(f"Трек «{artist} – {title}» не найден в открытых источниках.")
 
 
 @dp.message(Command("start"))
@@ -485,7 +576,7 @@ async def handle_link(message: types.Message):
         with tempfile.TemporaryDirectory() as tmp_dir:
             file_path, cover_path = await asyncio.wait_for(
                 asyncio.to_thread(search_and_download, url, meta, tmp_dir),
-                timeout=50.0,
+                timeout=45.0,
             )
 
             caption_parts = [f"🎵 <b>{clean_artist} – {clean_title}</b>"]
