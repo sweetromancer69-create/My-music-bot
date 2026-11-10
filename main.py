@@ -773,24 +773,17 @@ def download_from_soundcloud_search(meta: dict, target_format: str, tmp_dir: str
     is_bp = (meta.get("platform") == "beatport")
     queries = []
 
-    if is_bp:
-        # Для Beatport в приоритете поиск полного Extended Mix
-        if mix and mix.lower() not in title.lower():
-            queries.append(f"scsearch5:{clean_artist} {title} {mix}".strip())
-        queries.append(f"scsearch5:{clean_artist} {title} Extended Mix".strip())
-        queries.append(f"scsearch5:{clean_artist} {title}".strip())
+    # 1. YouTube поиск - самый надёжный и быстрый источник (официальные релизы и лейблы)
+    queries.append(f"ytsearch5:{clean_artist} {title}".strip())
+    if mix and mix.lower() not in title.lower():
+        queries.append(f"ytsearch5:{clean_artist} {title} {mix}".strip())
+    elif is_bp:
+        queries.append(f"ytsearch5:{clean_artist} {title} Extended".strip())
 
-        if mix and mix.lower() not in title.lower():
-            queries.append(f"ytsearch5:{clean_artist} {title} {mix}".strip())
-        queries.append(f"ytsearch5:{clean_artist} {title} Extended Mix".strip())
-        queries.append(f"ytsearch5:{clean_artist} {title}".strip())
-    else:
-        # Для Deezer, Qobuz и других сервисов ищем оригинальную альбомную версию
-        if mix and mix.lower() not in title.lower():
-            queries.append(f"ytsearch5:{clean_artist} {title} {mix}".strip())
-            queries.append(f"scsearch5:{clean_artist} {title} {mix}".strip())
-        queries.append(f"ytsearch5:{clean_artist} {title}".strip())
-        queries.append(f"scsearch5:{clean_artist} {title}".strip())
+    # 2. Резервный поиск в SoundCloud
+    queries.append(f"scsearch5:{clean_artist} {title}".strip())
+    if mix and mix.lower() not in title.lower():
+        queries.append(f"scsearch5:{clean_artist} {title} {mix}".strip())
 
     ydl_opts = {
         "format": "bestaudio/best",
@@ -798,16 +791,22 @@ def download_from_soundcloud_search(meta: dict, target_format: str, tmp_dir: str
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "socket_timeout": 20,
+        "socket_timeout": 15,
     }
 
-    req_tit = normalize_for_match(title)
+    # Очищаем базовое название для надёжного совпадения (без скобок и версий)
+    base_title = re.sub(r"[\(\[].*?[\)\]]", "", title).strip()
+    req_tit = normalize_for_match(base_title or title)
     req_art = normalize_for_match(clean_artist)
-    radio_candidate = None
+
+    best_candidate = None
+    min_dur_diff = 999999
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             for query in queries:
+                if not query:
+                    continue
                 try:
                     info = ydl.extract_info(query, download=False)
                     entries = info.get("entries") or []
@@ -817,25 +816,32 @@ def download_from_soundcloud_search(meta: dict, target_format: str, tmp_dir: str
                         ent_title = entry.get("title") or ""
                         ent_uploader = entry.get("uploader") or ""
                         dur = int(entry.get("duration") or 0)
+                        if dur < 30:
+                            continue
 
                         norm_text = normalize_for_match(f"{ent_uploader} {ent_title}")
                         if req_tit and req_tit not in norm_text:
                             continue
 
-                        # Точное совпадение по длительности для Extended Mix
-                        if expected_dur > 0 and abs(dur - expected_dur) <= 25:
+                        dur_diff = abs(dur - expected_dur) if expected_dur > 0 else 0
+
+                        # Точное или близкое совпадение по хронометражу (до 30 сек для интро/аутро)
+                        if expected_dur > 0 and dur_diff <= 30:
                             dl_info = ydl.extract_info(entry["webpage_url"], download=True)
                             dl_file = ydl.prepare_filename(dl_info)
                             return convert_audio_to_format(dl_file, target_format, tmp_dir), dur
 
-                        if dur > 60 and not radio_candidate:
-                            radio_candidate = (entry, dur)
-                except Exception:
-                    pass
+                        # Сохраняем лучшего кандидата
+                        if dur_diff < min_dur_diff:
+                            min_dur_diff = dur_diff
+                            best_candidate = (entry, dur)
+                except Exception as q_err:
+                    logger.debug(f"Query '{query}' failed: {q_err}")
 
-        if radio_candidate:
-            cand_entry, r_dur = radio_candidate
-            if allow_radio_fallback or expected_dur == 0:
+        # Если прямого совпадения по времени нет, но трек найден:
+        if best_candidate:
+            cand_entry, r_dur = best_candidate
+            if allow_radio_fallback or expected_dur == 0 or min_dur_diff <= 45:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     dl_info = ydl.extract_info(cand_entry["webpage_url"], download=True)
                     dl_file = ydl.prepare_filename(dl_info)
@@ -879,10 +885,12 @@ def process_download_request(url: str, meta: dict, target_format: str, tmp_dir: 
             actual_dur = int(info.get("duration") or 0)
             audio_path = convert_audio_to_format(dl_file, target_format, tmp_dir)
     else:
-        # Поиск трека (Beatport Extended / Deezer / Qobuz)
-        audio_path, actual_dur = download_from_audiomack(meta, target_format, tmp_dir, allow_radio_fallback)
+        # 1. Основной поиск через YouTube / SoundCloud (быстро и высокая точность)
+        audio_path, actual_dur = download_from_soundcloud_search(meta, target_format, tmp_dir, allow_radio_fallback)
+
+        # 2. Резервный поиск через Audiomack
         if not audio_path:
-            audio_path, actual_dur = download_from_soundcloud_search(meta, target_format, tmp_dir, allow_radio_fallback)
+            audio_path, actual_dur = download_from_audiomack(meta, target_format, tmp_dir, allow_radio_fallback)
 
         if not audio_path:
             clean_art = (meta.get("artist") or "Artist").strip()
