@@ -763,6 +763,58 @@ def download_from_audiomack(meta: dict, target_format: str, tmp_dir: str, allow_
     return None, 0
 
 
+def search_youtube_videos(query: str, limit: int = 5) -> list:
+    q = urllib.parse.quote(query)
+    url = f"https://www.youtube.com/results?search_query={q}"
+    req = urllib.request.Request(url, headers=HEADERS)
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            html = resp.read().decode("utf-8")
+            m = re.search(r"var ytInitialData = ({.*?});</script>", html)
+            if not m:
+                return []
+            data = json.loads(m.group(1))
+            sections = (
+                data.get("contents", {})
+                .get("twoColumnSearchResultsRenderer", {})
+                .get("primaryContents", {})
+                .get("sectionListRenderer", {})
+                .get("contents", [])
+            )
+            results = []
+            for sec in sections:
+                for item in sec.get("itemSectionRenderer", {}).get("contents", []):
+                    vr = item.get("videoRenderer")
+                    if vr:
+                        vid = vr.get("videoId")
+                        tit = vr.get("title", {}).get("runs", [{}])[0].get("text") or ""
+                        dur_text = vr.get("lengthText", {}).get("simpleText") or "0:00"
+                        owner = vr.get("ownerText", {}).get("runs", [{}])[0].get("text") or ""
+
+                        parts = dur_text.split(":")
+                        if len(parts) == 2:
+                            dur_sec = int(parts[0]) * 60 + int(parts[1])
+                        elif len(parts) == 3:
+                            dur_sec = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+                        else:
+                            dur_sec = 0
+
+                        if vid and tit:
+                            results.append({
+                                "id": vid,
+                                "url": f"https://www.youtube.com/watch?v={vid}",
+                                "title": tit,
+                                "uploader": owner,
+                                "duration": dur_sec,
+                            })
+                            if len(results) >= limit:
+                                return results
+            return results
+    except Exception as e:
+        logger.debug(f"Direct YouTube scrape error for '{query}': {e}")
+        return []
+
+
 def download_from_soundcloud_search(meta: dict, target_format: str, tmp_dir: str, allow_radio_fallback: bool = False):
     artist = (meta.get("artist") or "").strip()
     title = (meta.get("title") or "").strip()
@@ -771,19 +823,14 @@ def download_from_soundcloud_search(meta: dict, target_format: str, tmp_dir: str
     clean_artist = (artist.split(",")[0] or "").strip() if artist else ""
 
     is_bp = (meta.get("platform") == "beatport")
-    queries = []
 
-    # 1. YouTube поиск - самый надёжный и быстрый источник (официальные релизы и лейблы)
-    queries.append(f"ytsearch5:{clean_artist} {title}".strip())
+    # Формируем список поисковых фраз
+    yt_queries = []
+    yt_queries.append(f"{clean_artist} {title}".strip())
     if mix and mix.lower() not in title.lower():
-        queries.append(f"ytsearch5:{clean_artist} {title} {mix}".strip())
+        yt_queries.append(f"{clean_artist} {title} {mix}".strip())
     elif is_bp:
-        queries.append(f"ytsearch5:{clean_artist} {title} Extended".strip())
-
-    # 2. Резервный поиск в SoundCloud
-    queries.append(f"scsearch5:{clean_artist} {title}".strip())
-    if mix and mix.lower() not in title.lower():
-        queries.append(f"scsearch5:{clean_artist} {title} {mix}".strip())
+        yt_queries.append(f"{clean_artist} {title} Extended".strip())
 
     ydl_opts = {
         "format": "bestaudio/best",
@@ -791,7 +838,7 @@ def download_from_soundcloud_search(meta: dict, target_format: str, tmp_dir: str
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "socket_timeout": 15,
+        "socket_timeout": 20,
     }
 
     # Очищаем базовое название для надёжного совпадения (без скобок и версий)
@@ -803,47 +850,65 @@ def download_from_soundcloud_search(meta: dict, target_format: str, tmp_dir: str
     min_dur_diff = 999999
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            for query in queries:
-                if not query:
+        # 1. Прямой поиск по YouTube через браузерные заголовки (без бот-блокировок)
+        for q_str in yt_queries:
+            if not q_str:
+                continue
+            yt_items = search_youtube_videos(q_str, limit=5)
+            for item in yt_items:
+                dur = int(item.get("duration") or 0)
+                if dur < 30:
                     continue
-                try:
-                    info = ydl.extract_info(query, download=False)
-                    entries = info.get("entries") or []
-                    for entry in entries:
+
+                norm_text = normalize_for_match(f"{item.get('uploader')} {item.get('title')}")
+                if req_tit and req_tit not in norm_text:
+                    continue
+
+                dur_diff = abs(dur - expected_dur) if expected_dur > 0 else 0
+
+                # Точное совпадение по времени (разница до 35 сек с учётом интро)
+                if expected_dur > 0 and dur_diff <= 35:
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        dl_info = ydl.extract_info(item["url"], download=True)
+                        dl_file = ydl.prepare_filename(dl_info)
+                        return convert_audio_to_format(dl_file, target_format, tmp_dir), dur
+
+                if dur_diff < min_dur_diff:
+                    min_dur_diff = dur_diff
+                    best_candidate = (item["url"], dur)
+
+        # 2. Если в YouTube не подошло, пробуем через SoundCloud
+        if not best_candidate:
+            sc_query = f"scsearch5:{clean_artist} {title}".strip()
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(sc_query, download=False)
+                    for entry in (info.get("entries") or []):
                         if not entry:
                             continue
-                        ent_title = entry.get("title") or ""
-                        ent_uploader = entry.get("uploader") or ""
                         dur = int(entry.get("duration") or 0)
                         if dur < 30:
                             continue
-
-                        norm_text = normalize_for_match(f"{ent_uploader} {ent_title}")
+                        norm_text = normalize_for_match(f"{entry.get('uploader')} {entry.get('title')}")
                         if req_tit and req_tit not in norm_text:
                             continue
-
                         dur_diff = abs(dur - expected_dur) if expected_dur > 0 else 0
-
-                        # Точное или близкое совпадение по хронометражу (до 30 сек для интро/аутро)
-                        if expected_dur > 0 and dur_diff <= 30:
+                        if expected_dur > 0 and dur_diff <= 35:
                             dl_info = ydl.extract_info(entry["webpage_url"], download=True)
                             dl_file = ydl.prepare_filename(dl_info)
                             return convert_audio_to_format(dl_file, target_format, tmp_dir), dur
-
-                        # Сохраняем лучшего кандидата
                         if dur_diff < min_dur_diff:
                             min_dur_diff = dur_diff
-                            best_candidate = (entry, dur)
-                except Exception as q_err:
-                    logger.debug(f"Query '{query}' failed: {q_err}")
+                            best_candidate = (entry["webpage_url"], dur)
+            except Exception:
+                pass
 
-        # Если прямого совпадения по времени нет, но трек найден:
+        # 3. Скачиваем лучшего кандидата
         if best_candidate:
-            cand_entry, r_dur = best_candidate
-            if allow_radio_fallback or expected_dur == 0 or min_dur_diff <= 45:
+            cand_url, r_dur = best_candidate
+            if allow_radio_fallback or expected_dur == 0 or min_dur_diff <= 50:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    dl_info = ydl.extract_info(cand_entry["webpage_url"], download=True)
+                    dl_info = ydl.extract_info(cand_url, download=True)
                     dl_file = ydl.prepare_filename(dl_info)
                     return convert_audio_to_format(dl_file, target_format, tmp_dir), r_dur
             else:
