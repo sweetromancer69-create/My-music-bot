@@ -4,6 +4,7 @@ import json
 import asyncio
 import logging
 import tempfile
+import urllib.parse
 from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
@@ -35,12 +36,11 @@ HEADERS = {
 
 def clean_beatport_title(raw_text: str):
     """
-    Разбивает заголовок Beatport вида:
+    Разбивает заголовок Beatport:
     'John Monkman - Deform (Extended Mix) [Beesemyer Music] | Music & Downloads on Beatport'
     на (artist, title, label)
     """
     cleaned = raw_text
-    # Удаляем хвосты сайтов
     cleaned = re.sub(r'\|\s*Music\s*&?\s*Downloads\s*on\s*Beatport.*$', '', cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'\|\s*Beatport.*$', '', cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'\s+on\s+Beatport.*$', '', cleaned, flags=re.IGNORECASE)
@@ -49,7 +49,6 @@ def clean_beatport_title(raw_text: str):
     cleaned = re.sub(r'\s+\|\s+SoundCloud.*$', '', cleaned, flags=re.IGNORECASE)
     cleaned = cleaned.strip()
 
-    # Извлекаем лейбл в квадратных скобках [Label]
     label = ""
     label_match = re.search(r'\[([^\]]+)\]\s*$', cleaned)
     if label_match:
@@ -95,7 +94,6 @@ def parse_beatport(url: str) -> dict:
                     for q in queries:
                         state_data = q.get("state", {}).get("data", {})
                         if isinstance(state_data, dict):
-                            # Может быть прямо в корне data или в track
                             t_info = state_data.get("track") if "track" in state_data else state_data
                             if t_info and (t_info.get("name") or t_info.get("title")):
                                 meta["title"] = t_info.get("name") or t_info.get("title") or ""
@@ -145,6 +143,39 @@ def parse_beatport(url: str) -> dict:
     return meta
 
 
+def find_direct_youtube_url(artist: str, title: str, mix: str) -> str:
+    """
+    Быстрый поиск ID видео через прямой запрос к YouTube Search (менее 1 сек).
+    Позволяет yt-dlp скачивать напрямую без зависания на внутреннем поиске.
+    """
+    search_terms = []
+    clean_mix = mix.strip() if mix and mix.lower() != "original mix" else ""
+    if clean_mix and clean_mix.lower() not in title.lower():
+        search_terms.append(f"{artist} - {title} {clean_mix}")
+    search_terms.append(f"{artist} - {title}")
+    search_terms.append(f"{artist} {title}")
+
+    for term in search_terms:
+        encoded = urllib.parse.quote(term)
+        search_url = f"https://www.youtube.com/results?search_query={encoded}"
+        try:
+            r = requests.get(search_url, headers=HEADERS, timeout=6)
+            if r.ok:
+                vids = re.findall(r'"videoId":"([a-zA-Z0-9_-]{11})"', r.text)
+                if vids:
+                    # Исключаем дубли
+                    seen = set()
+                    unique_vids = [x for x in vids if not (x in seen or seen.add(x))]
+                    if unique_vids:
+                        logger.info(f"Fast YouTube search found video: {unique_vids[0]} for query: {term}")
+                        return f"https://www.youtube.com/watch?v={unique_vids[0]}"
+        except Exception as e:
+            logger.warning(f"Fast YouTube search error on '{term}': {e}")
+            continue
+
+    return ""
+
+
 def embed_tags(file_path: str, meta: dict):
     try:
         try:
@@ -168,7 +199,7 @@ def embed_tags(file_path: str, meta: dict):
 
         if meta.get("cover_url"):
             try:
-                img_r = requests.get(meta["cover_url"], headers=HEADERS, timeout=10)
+                img_r = requests.get(meta["cover_url"], headers=HEADERS, timeout=8)
                 if img_r.ok:
                     tags["APIC"] = APIC(
                         encoding=3,
@@ -190,30 +221,22 @@ def search_and_download(meta: dict, tmp_dir: str) -> str:
     title = meta.get("title", "").strip()
     mix = meta.get("mix", "").strip()
 
-    # Чистые поисковые фразы от точной к более широкой
-    queries = []
-    if artist and title:
-        if mix and mix.lower() not in title.lower() and mix != "Original Mix":
-            queries.append(f"{artist} - {title} ({mix})")
-        queries.append(f"{artist} - {title}")
-        queries.append(f"{artist} {title}")
-    elif title:
-        queries.append(title)
+    out_tmpl = os.path.join(tmp_dir, "audio.%(ext)s")
 
-    out_tmpl = os.path.join(tmp_dir, "track.%(ext)s")
-
-    # Формируем каскад провайдеров
-    # YouTube Music (с обходом Cloudflare через android client) -> SoundCloud -> VK
+    # yt-dlp опции со строгим таймаутом, чтобы процесс никогда не зависал
     ydl_opts = {
         "format": "bestaudio[ext=mp3]/bestaudio/best",
         "outtmpl": out_tmpl,
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
+        "socket_timeout": 12,
+        "retries": 2,
+        "fragment_retries": 2,
         "http_headers": HEADERS,
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "web"]
+                "player_client": ["android", "ios", "web"]
             }
         },
         "postprocessors": [
@@ -225,48 +248,50 @@ def search_and_download(meta: dict, tmp_dir: str) -> str:
         ],
     }
 
-    # Попытка поиска через каскад источников
+    # 1. Сначала пробуем прямой YouTube URL, найденный за 1 секунду
+    direct_yt = find_direct_youtube_url(artist, title, mix)
     downloaded = False
-    for q in queries:
-        targets = [
-            f"ytsearch1:{q}",       # 1. YouTube / YouTube Music (официальные релизы Topic)
-            f"scsearch1:{q}",       # 2. SoundCloud (клубные эксклюзивы и extended-версии)
-            f"vksearch1:{q}",       # 3. VK Музыка
-            f"bandcampsearch1:{q}", # 4. Bandcamp
-        ]
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            for target in targets:
-                try:
-                    logger.info(f"Searching via {target}")
-                    info = ydl.extract_info(target, download=True)
-                    if info:
-                        downloaded = True
-                        break
-                except Exception as err:
-                    logger.warning(f"Provider {target} failed: {err}")
-                    continue
-        if downloaded:
-            break
 
-    # Ищем готовый mp3
+    targets = []
+    if direct_yt:
+        targets.append(direct_yt)
+
+    # 2. Резервные запросы (SoundCloud и прямой scsearch)
+    clean_q = f"{artist} {title}".strip()
+    targets.append(f"scsearch1:{clean_q}")
+    targets.append(f"scsearch1:{artist} {title} {mix}".strip())
+    targets.append(f"vksearch1:{clean_q}")
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        for target in targets:
+            try:
+                logger.info(f"Downloading from target: {target}")
+                info = ydl.extract_info(target, download=True)
+                if info:
+                    downloaded = True
+                    break
+            except Exception as err:
+                logger.warning(f"Target {target} failed: {err}")
+                continue
+
+    # Проверяем скачанный файл
     candidates = list(Path(tmp_dir).glob("*.mp3"))
     if not candidates:
-        # Если mp3 нет, ищем любой скачанный аудиофайл
-        candidates = list(Path(tmp_dir).glob("track.*"))
+        candidates = list(Path(tmp_dir).glob("audio.*"))
 
     if candidates:
         final_file = str(candidates[0])
         embed_tags(final_file, meta)
         return final_file
 
-    raise RuntimeError(f"Трек не найден на музыкальных платформах по запросам: {', '.join(queries)}")
+    raise RuntimeError(f"Не удалось выкачать аудио для {artist} – {title}")
 
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
         "🎧 <b>Musicvibez.org Beatport Downloader</b>\n\n"
-        "Отправьте ссылку на трек с <b>Beatport</b>, <b>SoundCloud</b> или <b>Deezer</b>.\n\n"
+        "Отправьте мне ссылку на трек с <b>Beatport</b>, <b>SoundCloud</b> или <b>Deezer</b>.\n\n"
         "⚡ Бот моментально найдёт полный трек, выкачает его в 320 kbps MP3, пропишет BPM, тональность, лейбл и обложку!",
         parse_mode="HTML",
     )
@@ -274,10 +299,6 @@ async def cmd_start(message: types.Message):
 
 @dp.message(F.text)
 async def handle_link(message: types.Message):
-    if ADMIN_ID and message.from_user.id != ADMIN_ID:
-        # Если хотите разрешить всем — просто уберите эту проверку
-        pass
-
     text = (message.text or "").strip()
     url_match = re.search(r"(https?://\S+)", text)
     if not url_match:
@@ -285,17 +306,16 @@ async def handle_link(message: types.Message):
         return
 
     url = url_match.group(1)
-    status_msg = await message.answer("🔍 Читаю метаданные Beatport и ищу трек...")
+    status_msg = await message.answer("🔍 Читаю страницу Beatport...")
 
     try:
-        # Парсим метаданные
-        meta = await asyncio.to_thread(parse_beatport, url)
+        # Парсим метаданные (не более 12 сек)
+        meta = await asyncio.wait_for(asyncio.to_thread(parse_beatport, url), timeout=15.0)
+
         if not meta.get("title"):
-            # Попробуем резервный чистый парсинг из URL
             slug_match = re.search(r"/track/([^/]+)/(\d+)", url)
             if slug_match:
-                slug_name = slug_match.group(1).replace("-", " ").title()
-                meta["title"] = slug_name
+                meta["title"] = slug_match.group(1).replace("-", " ").title()
 
         clean_artist = meta.get("artist") or "Various Artists"
         clean_title = meta.get("title") or "Track"
@@ -304,12 +324,16 @@ async def handle_link(message: types.Message):
 
         await status_msg.edit_text(
             f"🎵 Найдено: <b>{clean_artist} – {clean_title}</b>\n"
-            f"⏳ Скачиваем аудио и оформляем ID3-теги...",
+            f"⚡ Ищу аудиопоток и скачиваю трек...",
             parse_mode="HTML",
         )
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            file_path = await asyncio.to_thread(search_and_download, meta, tmp_dir)
+            # Ограничиваем скачивание таймаутом 45 сек, чтобы бот никогда не висел!
+            file_path = await asyncio.wait_for(
+                asyncio.to_thread(search_and_download, meta, tmp_dir),
+                timeout=45.0,
+            )
 
             caption_parts = [f"🎵 <b>{clean_artist} – {clean_title}</b>"]
             if meta.get("label"):
@@ -320,9 +344,10 @@ async def handle_link(message: types.Message):
                 caption_parts.append(f"🎹 <b>Key:</b> {meta['key']}")
             caption_parts.append("\n🎧 <i>Downloaded via @sweet_music_dl_bot</i>")
 
-            filename = f"{clean_artist} - {clean_title}.mp3".replace("/", "_").replace("\\", "_")
-            audio_file = FSInputFile(file_path, filename=filename)
+            clean_filename = f"{clean_artist} - {clean_title}.mp3".replace("/", "_").replace("\\", "_").replace(":", "")
+            audio_file = FSInputFile(file_path, filename=clean_filename)
 
+            await status_msg.edit_text("🚀 Отправляю аудиофайл в Telegram...")
             await message.answer_audio(
                 audio=audio_file,
                 title=clean_title,
@@ -332,9 +357,12 @@ async def handle_link(message: types.Message):
             )
             await status_msg.delete()
 
+    except asyncio.TimeoutError:
+        logger.error("Download timeout exceeded")
+        await status_msg.edit_text("⏳ Время ожидания ответа аудио-серверов истекло. Попробуйте еще раз.")
     except Exception as e:
         logger.exception("Error processing link")
-        await status_msg.edit_text(f"❌ Ошибка при обработке: {str(e)[:300]}")
+        await status_msg.edit_text(f"❌ Ошибка: {str(e)[:250]}")
 
 
 async def main():
