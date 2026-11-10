@@ -846,12 +846,24 @@ def download_from_soundcloud_search(meta: dict, target_format: str, tmp_dir: str
         },
     }
 
+    if os.path.exists("cookies.txt"):
+        ydl_opts["cookiefile"] = "cookies.txt"
+    elif os.getenv("YOUTUBE_COOKIES_TEXT"):
+        cpath = os.path.join(tmp_dir, "yt_cookies.txt")
+        try:
+            with open(cpath, "w", encoding="utf-8") as cf:
+                cf.write(os.getenv("YOUTUBE_COOKIES_TEXT"))
+            ydl_opts["cookiefile"] = cpath
+        except Exception:
+            pass
+
     # Очищаем базовое название для надёжного совпадения (без скобок и версий)
     base_title = re.sub(r"[\(\[].*?[\)\]]", "", title).strip()
     req_tit = normalize_for_match(base_title or title)
     req_art = normalize_for_match(clean_artist)
 
-    candidates = []
+    yt_candidates = []
+    sc_candidates = []
 
     # 1. Прямой поиск по YouTube через браузерные заголовки
     for q_str in yt_queries:
@@ -868,11 +880,17 @@ def download_from_soundcloud_search(meta: dict, target_format: str, tmp_dir: str
                 continue
 
             dur_diff = abs(dur - expected_dur) if expected_dur > 0 else 0
-            candidates.append((dur_diff, item["url"], dur))
+            yt_candidates.append((dur_diff, item["url"], dur))
 
-    # 2. Если в YouTube мало кандидатов, добавляем SoundCloud
-    if len(candidates) < 2:
-        sc_query = f"scsearch5:{clean_artist} {title}".strip()
+    # 2. Поиск по SoundCloud
+    sc_queries = [f"{clean_artist} {title}".strip()]
+    if mix and mix.lower() not in title.lower():
+        sc_queries.append(f"{clean_artist} {title} {mix}".strip())
+
+    for sq in sc_queries:
+        if not sq:
+            continue
+        sc_query = f"scsearch5:{sq}"
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(sc_query, download=False)
@@ -886,16 +904,23 @@ def download_from_soundcloud_search(meta: dict, target_format: str, tmp_dir: str
                     if req_tit and req_tit not in norm_text:
                         continue
                     dur_diff = abs(dur - expected_dur) if expected_dur > 0 else 0
-                    candidates.append((dur_diff, entry["webpage_url"], dur))
-        except Exception:
-            pass
+                    sc_candidates.append((dur_diff, entry.get("webpage_url") or entry.get("url"), dur))
+        except Exception as sc_err:
+            logger.debug(f"SoundCloud search error: {sc_err}")
 
-    # Сортируем кандидатов по наименьшей разнице в длительности
-    candidates.sort(key=lambda x: x[0])
+    # Сортируем списки кандидатов по совпадению длительности
+    yt_candidates.sort(key=lambda x: x[0])
+    sc_candidates.sort(key=lambda x: x[0])
 
-    # 3. Скачиваем лучшего доступного кандидата с автоматическим перебором при ошибке
-    for dur_diff, cand_url, cand_dur in candidates:
-        if not (allow_radio_fallback or expected_dur == 0 or dur_diff <= 45):
+    # Объединяем: сначала проверенные кандидаты с наименьшей разницей, затем SoundCloud
+    all_candidates = yt_candidates + sc_candidates
+
+    # 3. Скачиваем лучшего доступного кандидата
+    # Для релизов/альбомов (allow_radio_fallback=True) допускаем гибкую длительность
+    for dur_diff, cand_url, cand_dur in all_candidates:
+        if not cand_url:
+            continue
+        if not (allow_radio_fallback or expected_dur == 0 or dur_diff <= 50):
             continue
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -907,9 +932,9 @@ def download_from_soundcloud_search(meta: dict, target_format: str, tmp_dir: str
             logger.warning(f"Download candidate failed ({cand_url}): {dl_err}")
             continue
 
-    if candidates and not allow_radio_fallback and expected_dur > 0:
-        best_diff, best_url, best_dur = candidates[0]
-        if best_diff > 45:
+    if all_candidates and not allow_radio_fallback and expected_dur > 0:
+        best_diff, best_url, best_dur = all_candidates[0]
+        if best_diff > 50:
             raise ValueError(f"EXTENDED_ONLY_ON_BEATPORT|{format_mm_ss(expected_dur)}|{format_mm_ss(best_dur)}")
 
     return None, 0
@@ -1306,7 +1331,7 @@ async def handle_download_all_release(call: CallbackQuery):
                     parse_mode="HTML",
                 )
                 success_count += 1
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(2.5)
         except Exception as err:
             logger.warning(f"Failed track {i} ({art} - {tit}): {err}")
             await call.message.answer(f"⚠️ Трек {i} (<b>{art} – {full_tit}</b>) пропущен: {str(err)[:120]}", parse_mode="HTML")
