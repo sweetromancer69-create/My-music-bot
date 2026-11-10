@@ -63,7 +63,7 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# Встроенные ключи Audiomack (OAuth 1.0)
+# Ключи Audiomack OAuth 1.0 (для поиска треков в высоком качестве)
 AM_CONSUMER_KEY = "38a7c6407df7918a2ea6f6631ad036bb"
 AM_CONSUMER_SECRET = "8f37bc905e94b2a8d5e0f59220970a2f"
 
@@ -85,7 +85,7 @@ def normalize_for_match(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
-# ==================== ПАРСИНГ МЕТАДАННЫХ BEATPORT ====================
+# ==================== ПАРСИНГ BEATPORT, DEEZER, QOBUZ ====================
 def clean_beatport_title(raw_text: str):
     if not raw_text:
         return None, None
@@ -193,7 +193,116 @@ def parse_beatport(url: str) -> dict:
     return meta
 
 
-# ==================== КОНВЕРТАЦИЯ В MP3 320 / FLAC / WAV ====================
+def parse_deezer(url: str) -> dict:
+    real_url = url.strip()
+    if "deezer.page.link" in real_url or "link.deezer.com" in real_url:
+        try:
+            r_redir = requests.get(real_url, headers=HEADERS, allow_redirects=True, timeout=10)
+            real_url = r_redir.url
+        except Exception:
+            pass
+    m = re.search(r"/track/(\d+)", real_url)
+    if not m:
+        raise ValueError("Не удалось извлечь ID трека из ссылки Deezer.")
+    tid = m.group(1)
+    meta = {
+        "platform": "deezer",
+        "track_id": tid,
+        "artist": "Unknown Artist",
+        "title": f"Deezer Track {tid}",
+        "mix": None,
+        "album": None,
+        "label": None,
+        "catalog": None,
+        "genre": None,
+        "bpm": None,
+        "key": None,
+        "isrc": None,
+        "release_date": None,
+        "cover_url": None,
+        "duration_sec": None,
+        "is_exclusive": False,
+    }
+    try:
+        r = requests.get(f"https://api.deezer.com/track/{tid}", headers=HEADERS, timeout=10)
+        if r.status_code == 200:
+            d = r.json()
+            meta["title"] = d.get("title_short") or d.get("title") or meta["title"]
+            meta["mix"] = d.get("title_version", "").strip("()") or None
+            if isinstance(d.get("artist"), dict):
+                meta["artist"] = d["artist"].get("name") or meta["artist"]
+            if isinstance(d.get("album"), dict):
+                meta["album"] = d["album"].get("title")
+                meta["cover_url"] = d["album"].get("cover_xl") or d["album"].get("cover_big")
+            meta["duration_sec"] = int(d.get("duration") or 0) or None
+            meta["isrc"] = d.get("isrc")
+            meta["bpm"] = str(int(d["bpm"])) if d.get("bpm") else None
+            meta["release_date"] = d.get("release_date")
+    except Exception as e:
+        logger.warning(f"Deezer metadata warning: {e}")
+    return meta
+
+
+def parse_qobuz(url: str) -> dict:
+    m = re.search(r"qobuz\.com/(?:[a-z]{2}-[a-z]{2}/)?track/(?:[^/?#]+/)?(\d+)", url, re.I)
+    if not m:
+        m = re.search(r"/track/(\d+)", url, re.I)
+    if not m:
+        raise ValueError("Не удалось извлечь ID трека из ссылки Qobuz.")
+    tid = m.group(1)
+    meta = {
+        "platform": "qobuz",
+        "track_id": tid,
+        "artist": "Unknown Artist",
+        "title": f"Qobuz Track {tid}",
+        "mix": None,
+        "album": None,
+        "label": None,
+        "catalog": None,
+        "genre": None,
+        "bpm": None,
+        "key": None,
+        "isrc": None,
+        "release_date": None,
+        "cover_url": None,
+        "duration_sec": None,
+        "is_exclusive": False,
+    }
+    try:
+        r = requests.get(
+            "https://www.qobuz.com/api.json/0.2/track/get",
+            params={"track_id": tid},
+            headers={"X-App-Id": "735532640", **HEADERS},
+            timeout=12,
+        )
+        if r.status_code == 200:
+            d = r.json()
+            meta["title"] = d.get("title") or meta["title"]
+            meta["mix"] = d.get("version") or None
+            perf = d.get("performer") or {}
+            if isinstance(perf, dict) and perf.get("name"):
+                meta["artist"] = perf["name"]
+            alb = d.get("album") or {}
+            if isinstance(alb, dict):
+                meta["album"] = alb.get("title")
+                img = alb.get("image") or {}
+                if isinstance(img, dict):
+                    meta["cover_url"] = img.get("large") or img.get("small")
+                lbl = alb.get("label") or {}
+                if isinstance(lbl, dict):
+                    meta["label"] = lbl.get("name")
+                gnr = alb.get("genre") or {}
+                if isinstance(gnr, dict):
+                    meta["genre"] = gnr.get("name")
+                meta["release_date"] = alb.get("release_date_original")
+            meta["duration_sec"] = int(d.get("duration") or 0) or None
+            meta["isrc"] = d.get("isrc")
+    except Exception as e:
+        logger.warning(f"Qobuz metadata warning: {e}")
+    return meta
+
+
+# ==================== КОНВЕРТАЦИЯ ФОРМАТОВ И ID3 / FLAC ТЕГИ ====================
 def convert_audio_to_format(input_path: str, target_format: str, tmp_dir: str) -> str:
     target_format = target_format.lower().strip()
     out_path = os.path.join(tmp_dir, f"converted_{uuid.uuid4().hex[:8]}.{target_format}")
@@ -289,7 +398,7 @@ def embed_tags(file_path: str, meta: dict, cover_bytes: bytes = None):
             logger.warning(f"FLAC tag error: {e}")
 
 
-# ==================== ПОИСК EXTENDED MIX БЕЗ КАПЧИ ====================
+# ==================== ПОИСК И СКАЧИВАНИЕ ====================
 def audiomack_api_get(path: str, params: dict = None) -> dict:
     params = dict(params or {})
     url = "https://api.audiomack.com/v1" + path
@@ -316,20 +425,19 @@ def audiomack_api_get(path: str, params: dict = None) -> dict:
     return r.json()
 
 
-def download_extended_from_audiomack(meta: dict, target_format: str, tmp_dir: str, allow_radio_fallback: bool = False):
+def download_from_audiomack(meta: dict, target_format: str, tmp_dir: str, allow_radio_fallback: bool = False):
     artist = meta.get("artist", "").strip()
     title = meta.get("title", "").strip()
     mix = meta.get("mix", "").strip()
     expected_dur = int(meta.get("duration_sec") or 0)
-
     clean_artist = artist.split(",")[0].strip()
+
     queries = [
         f"{clean_artist} {title} {mix}".strip(),
         f"{clean_artist} {title} Extended",
         f"{clean_artist} {title}",
     ]
     seen_ids = set()
-
     radio_candidates = []
 
     for q in queries:
@@ -349,20 +457,17 @@ def download_extended_from_audiomack(meta: dict, target_format: str, tmp_dir: st
                 res_tit = normalize_for_match(item.get("title") or "")
                 dur = int(item.get("duration") or 0)
 
-                # Проверяем соответствие артиста и названия
                 if req_art not in res_art and res_art not in req_art:
                     continue
                 if req_tit not in res_tit:
                     continue
 
-                # Сверяем длительность
                 stream_url = item.get("stream_url") or item.get("download_url")
                 if not stream_url:
                     continue
 
-                if expected_dur > 0 and abs(dur - expected_dur) <= 20:
-                    # Нашли точный Extended Mix!
-                    raw_path = os.path.join(tmp_dir, f"audiomack_{item_id}.mp3")
+                if expected_dur > 0 and abs(dur - expected_dur) <= 25:
+                    raw_path = os.path.join(tmp_dir, f"am_{item_id}.mp3")
                     with requests.get(stream_url, headers=HEADERS, stream=True, timeout=60) as r:
                         r.raise_for_status()
                         with open(raw_path, "wb") as f:
@@ -378,8 +483,8 @@ def download_extended_from_audiomack(meta: dict, target_format: str, tmp_dir: st
 
     if radio_candidates:
         radio_item, r_dur, r_url = radio_candidates[0]
-        if allow_radio_fallback:
-            raw_path = os.path.join(tmp_dir, f"audiomack_radio_{radio_item.get('id')}.mp3")
+        if allow_radio_fallback or expected_dur == 0:
+            raw_path = os.path.join(tmp_dir, f"am_radio_{radio_item.get('id')}.mp3")
             with requests.get(r_url, headers=HEADERS, stream=True, timeout=60) as r:
                 r.raise_for_status()
                 with open(raw_path, "wb") as f:
@@ -393,17 +498,13 @@ def download_extended_from_audiomack(meta: dict, target_format: str, tmp_dir: st
     return None, 0
 
 
-def download_extended_from_soundcloud_search(meta: dict, target_format: str, tmp_dir: str, allow_radio_fallback: bool = False):
-    """
-    Ищет оригинальный Extended Mix на SoundCloud без YouTube и без капч!
-    """
+def download_from_soundcloud_search(meta: dict, target_format: str, tmp_dir: str, allow_radio_fallback: bool = False):
     artist = meta.get("artist", "").strip()
     title = meta.get("title", "").strip()
-    mix = meta.get("mix", "").strip()
     expected_dur = int(meta.get("duration_sec") or 0)
     clean_artist = artist.split(",")[0].strip()
 
-    search_query = f"scsearch5:{clean_artist} {title} Extended Mix"
+    search_query = f"scsearch5:{clean_artist} {title} Extended Mix" if meta.get("platform") == "beatport" else f"scsearch5:{clean_artist} {title}"
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": os.path.join(tmp_dir, "sc_search_%(id)s.%(ext)s"),
@@ -413,7 +514,6 @@ def download_extended_from_soundcloud_search(meta: dict, target_format: str, tmp
         "socket_timeout": 20,
     }
 
-    req_art = normalize_for_match(clean_artist)
     req_tit = normalize_for_match(title)
     radio_candidate = None
 
@@ -432,8 +532,7 @@ def download_extended_from_soundcloud_search(meta: dict, target_format: str, tmp
                 if req_tit not in norm_text:
                     continue
 
-                if expected_dur > 0 and abs(dur - expected_dur) <= 20:
-                    # Идеальное совпадение Extended Mix!
+                if expected_dur > 0 and abs(dur - expected_dur) <= 25:
                     dl_info = ydl.extract_info(entry["webpage_url"], download=True)
                     dl_file = ydl.prepare_filename(dl_info)
                     return convert_audio_to_format(dl_file, target_format, tmp_dir), dur
@@ -443,7 +542,7 @@ def download_extended_from_soundcloud_search(meta: dict, target_format: str, tmp
 
         if radio_candidate:
             cand_entry, r_dur = radio_candidate
-            if allow_radio_fallback:
+            if allow_radio_fallback or expected_dur == 0:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     dl_info = ydl.extract_info(cand_entry["webpage_url"], download=True)
                     dl_file = ydl.prepare_filename(dl_info)
@@ -458,12 +557,11 @@ def download_extended_from_soundcloud_search(meta: dict, target_format: str, tmp
     return None, 0
 
 
-# ==================== ОСНОВНОЙ ПАЙПЛАЙН СКАЧИВАНИЯ ====================
 def process_download_request(url: str, meta: dict, target_format: str, tmp_dir: str, allow_radio_fallback: bool = False):
     actual_dur = meta.get("duration_sec") or 0
     audio_path = None
 
-    # 1. Если пользователь сам скинул прямую ссылку на SoundCloud или Bandcamp
+    # Прямая ссылка на SoundCloud или Bandcamp
     if any(d in url.lower() for d in ("soundcloud.com", "bandcamp.com")):
         out_tmpl = os.path.join(tmp_dir, "direct_%(id)s.%(ext)s")
         ydl_opts = {
@@ -487,22 +585,18 @@ def process_download_request(url: str, meta: dict, target_format: str, tmp_dir: 
                 meta["cover_url"] = info.get("thumbnail")
             actual_dur = int(info.get("duration") or 0)
             audio_path = convert_audio_to_format(dl_file, target_format, tmp_dir)
-
-    # 2. Поиск оригинального Extended Mix по открытым аудио-платформам (Audiomack / SoundCloud)
     else:
-        # Сначала пробуем Audiomack (чистый 320 kbps MP3 / FLAC)
-        audio_path, actual_dur = download_extended_from_audiomack(meta, target_format, tmp_dir, allow_radio_fallback)
-
-        # Если на Audiomack нет, ищем точный Extended Mix на SoundCloud
+        # Поиск трека (Beatport Extended / Deezer / Qobuz)
+        audio_path, actual_dur = download_from_audiomack(meta, target_format, tmp_dir, allow_radio_fallback)
         if not audio_path:
-            audio_path, actual_dur = download_extended_from_soundcloud_search(meta, target_format, tmp_dir, allow_radio_fallback)
+            audio_path, actual_dur = download_from_soundcloud_search(meta, target_format, tmp_dir, allow_radio_fallback)
 
         if not audio_path:
-            raise ValueError(
-                f"Трек <b>{meta.get('artist')} – {meta.get('title')}</b> не найден в открытом доступе."
-            )
+            clean_art = meta.get("artist") or "Artist"
+            clean_tit = meta.get("title") or "Track"
+            raise ValueError(f"Трек <b>{clean_art} – {clean_tit}</b> не найден в открытых музыкальных базах.")
 
-    # Скачиваем оригинальную обложку Beatport (1400x1400) и вшиваем все теги
+    # Скачиваем оригинальную обложку релиза и вшиваем все метаданные
     cover_bytes = None
     cover_path = None
     if meta.get("cover_url"):
@@ -524,11 +618,12 @@ def process_download_request(url: str, meta: dict, target_format: str, tmp_dir: 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
-        "👋 <b>Привет! Я загрузчик музыки для DJ:</b>\n\n"
-        "• <b>Beatport</b> (парсинг BPM, Key, Label, даты релиза и поиск полных <b>Extended Mix</b>)\n"
+        "👋 <b>Привет! Я бот для скачивания треков для DJ:</b>\n\n"
+        "• <b>Beatport</b> (парсинг BPM, тональности Key, лейбла и поиск полных <b>Extended Mix</b>)\n"
+        "• <b>Deezer</b> и <b>Qobuz</b> (поиск треков и скачивание в выбранном формате)\n"
         "• <b>SoundCloud / Bandcamp</b> (по прямой ссылке)\n\n"
-        "💎 <b>Никаких капч, подтверждений и привязки карт!</b>\n"
-        "Просто отправьте ссылку на трек Beatport или SoundCloud.",
+        "💎 <b>Никаких капч, привязок карт и подтверждений!</b>\n"
+        "Отправьте ссылку на трек, выберите формат (<b>MP3 320 / FLAC / WAV</b>) и бот пришлёт файл.",
         parse_mode="HTML",
     )
 
@@ -538,7 +633,10 @@ async def handle_link(message: types.Message):
     text = message.text.strip()
     url_match = re.search(r"(https?://\S+)", text)
     if not url_match:
-        await message.answer("Отправьте ссылку на трек с <b>Beatport</b> или <b>SoundCloud</b>.", parse_mode="HTML")
+        await message.answer(
+            "Отправьте ссылку на трек с <b>Beatport</b>, <b>Deezer</b>, <b>Qobuz</b> или <b>SoundCloud</b>.",
+            parse_mode="HTML",
+        )
         return
 
     url = url_match.group(1).strip()
@@ -564,15 +662,25 @@ async def handle_link(message: types.Message):
         )
         return
 
-    if "beatport.com" not in low_url:
-        await message.answer("⚠️ Поддерживаются ссылки на <b>Beatport</b> и <b>SoundCloud</b>.", parse_mode="HTML")
-        return
-
-    status_msg = await message.answer("🔍 Читаю данные трека с Beatport...")
+    status_msg = await message.answer("🔍 Читаю данные трека...")
     try:
-        meta = await asyncio.wait_for(asyncio.to_thread(parse_beatport, url), timeout=15.0)
+        if "beatport.com" in low_url:
+            meta = await asyncio.wait_for(asyncio.to_thread(parse_beatport, url), timeout=15.0)
+            plat_badge = "🎧 <b>Beatport Track</b>"
+        elif "deezer." in low_url or "deezer.page.link" in low_url:
+            meta = await asyncio.wait_for(asyncio.to_thread(parse_deezer, url), timeout=15.0)
+            plat_badge = "💜 <b>Deezer Track</b>"
+        elif "qobuz.com" in low_url:
+            meta = await asyncio.wait_for(asyncio.to_thread(parse_qobuz, url), timeout=15.0)
+            plat_badge = "💿 <b>Qobuz Track</b>"
+        else:
+            await status_msg.edit_text(
+                "⚠️ Поддерживаются ссылки на <b>Beatport</b>, <b>Deezer</b>, <b>Qobuz</b> и <b>SoundCloud</b>.",
+                parse_mode="HTML",
+            )
+            return
     except Exception as e:
-        await status_msg.edit_text(f"❌ Ошибка разбора Beatport: {e}")
+        await status_msg.edit_text(f"❌ Ошибка разбора ссылки: {e}")
         return
 
     clean_artist = meta.get("artist") or "Various Artists"
@@ -586,7 +694,10 @@ async def handle_link(message: types.Message):
     dur_str = format_mm_ss(meta.get("duration_sec") or 0)
     excl_badge = " 🔒 <i>(Beatport Exclusive)</i>" if meta.get("is_exclusive") else ""
 
-    lines = [f"🎵 <b>{clean_artist} – {clean_title}</b>{excl_badge}"]
+    lines = [
+        plat_badge,
+        f"🎵 <b>{clean_artist} – {clean_title}</b>{excl_badge}",
+    ]
     if meta.get("label"):
         lbl_str = f"{meta['label']} [{meta['catalog']}]" if meta.get("catalog") else meta["label"]
         lines.append(f"🏷 <b>Label:</b> {lbl_str}")
@@ -595,7 +706,7 @@ async def handle_link(message: types.Message):
     if meta.get("bpm") or meta.get("key"):
         lines.append(f"⚡ <b>BPM:</b> {meta.get('bpm') or '—'} | 🎹 <b>Key:</b> {meta.get('key') or '—'}")
     if meta.get("duration_sec"):
-        lines.append(f"⏱ <b>Длительность (Extended):</b> {dur_str}")
+        lines.append(f"⏱ <b>Длительность:</b> {dur_str}")
     lines.append("\n👇 <b>Выберите формат:</b>")
 
     kb = InlineKeyboardMarkup(
@@ -634,7 +745,7 @@ async def handle_format_callback(call: CallbackQuery):
     await call.answer(f"Готовлю {fmt.upper()}...")
     await call.message.edit_text(
         f"⏳ <b>{clean_artist} – {clean_title}</b>\n"
-        f"Формат: <b>{fmt.upper()}</b> | Поиск оригинальной Extended-версии...",
+        f"Формат: <b>{fmt.upper()}</b> | Поиск оригинальной версии...",
         parse_mode="HTML",
     )
 
