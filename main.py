@@ -5,6 +5,7 @@ import time
 import uuid
 import hmac
 import base64
+import shutil
 import hashlib
 import asyncio
 import logging
@@ -15,6 +16,7 @@ from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 import yt_dlp
+from aiohttp import web
 from mutagen.id3 import ID3, TIT2, TPE1, TALB, TBPM, TKEY, TCON, APIC, ID3NoHeaderError
 from mutagen.flac import FLAC, Picture
 from aiogram import Bot, Dispatcher, types, F
@@ -23,6 +25,16 @@ from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButto
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+# Автоматический поиск ffmpeg (системный или из пакета imageio-ffmpeg)
+FFMPEG_BIN = shutil.which("ffmpeg")
+if not FFMPEG_BIN:
+    try:
+        import imageio_ffmpeg
+        FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        FFMPEG_BIN = "ffmpeg"
+logger.info(f"Using FFMPEG binary: {FFMPEG_BIN}")
 
 # ==================== НАСТРОЙКИ ИЗ ОКРУЖЕНИЯ ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
@@ -43,14 +55,12 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# Официальный OAuth2 client_id от Beatport API v4 (как в beatportdl)
 BP_CLIENT_ID = "ryZ8LuyQVPqbK2mBX2Hwt4qSMtnWuTYSqBPO92yQ"
 BP_BASE_URL = "https://api.beatport.com/v4"
 
 AM_CONSUMER_KEY = "audiomack-web"
 AM_CONSUMER_SECRET = "bd8a07e9f23fbe9d808646b730f89b8e"
 
-_SC_CLIENT_ID_CACHE = {"id": "", "ts": 0}
 _BP_AUTH_STATE = {
     "username": BEATPORT_USERNAME,
     "password": BEATPORT_PASSWORD,
@@ -59,7 +69,6 @@ _BP_AUTH_STATE = {
     "expires_at": 0,
 }
 
-# Кэш метаданных для кнопок выбора формата (MP3 320 / FLAC / WAV)
 _PENDING_TRACKS = {}
 
 
@@ -72,14 +81,10 @@ def format_mm_ss(seconds: int) -> str:
 
 # ==================== BEATPORT API v4 DIRECT ENGINE ====================
 def bp_login_and_get_token() -> str:
-    """
-    Прямая авторизация в Beatport API v4 (аналог beatportdl) для скачивания оригиналов FLAC / MP3 320 напрямую с Beatport.
-    """
     now = time.time()
     if _BP_AUTH_STATE["access_token"] and (_BP_AUTH_STATE["expires_at"] == 0 or now < _BP_AUTH_STATE["expires_at"] - 60):
         return _BP_AUTH_STATE["access_token"]
 
-    # Попытка обновить по refresh_token
     if _BP_AUTH_STATE["refresh_token"]:
         try:
             r = requests.post(
@@ -109,7 +114,6 @@ def bp_login_and_get_token() -> str:
     try:
         sess = requests.Session()
         sess.headers.update(HEADERS)
-        # 1. Login -> sessionid cookie
         login_r = sess.post(
             f"{BP_BASE_URL}/auth/login/",
             json={"username": username, "password": password},
@@ -119,7 +123,6 @@ def bp_login_and_get_token() -> str:
             logger.warning(f"Beatport login failed ({login_r.status_code}): {login_r.text[:200]}")
             return ""
 
-        # 2. Authorize -> code
         auth_r = sess.get(
             f"{BP_BASE_URL}/auth/o/authorize/?client_id={BP_CLIENT_ID}&response_type=code",
             allow_redirects=False,
@@ -132,7 +135,6 @@ def bp_login_and_get_token() -> str:
             logger.warning("Beatport authorize did not return code")
             return ""
 
-        # 3. Issue token
         tok_r = sess.post(
             f"{BP_BASE_URL}/auth/o/token/",
             data={
@@ -155,10 +157,6 @@ def bp_login_and_get_token() -> str:
 
 
 def download_direct_from_beatport_api(track_id: str, target_format: str, tmp_dir: str) -> str:
-    """
-    Скачивает 100% оригинальный Extended Mix напрямую с серверов Beatport API v4
-    (/v4/catalog/tracks/{id}/download/?quality=lossless или high), если подключен аккаунт Beatport.
-    """
     token = bp_login_and_get_token()
     if not token or not track_id:
         return ""
@@ -349,11 +347,11 @@ def convert_audio_to_format(input_path: str, target_format: str, tmp_dir: str) -
     ext = target_format.lower()
     out_path = os.path.join(tmp_dir, f"output.{ext}")
     if ext == "flac":
-        cmd = ["ffmpeg", "-y", "-i", input_path, "-vn", "-ar", "44100", "-ac", "2", "-c:a", "flac", out_path]
+        cmd = [FFMPEG_BIN, "-y", "-i", input_path, "-vn", "-ar", "44100", "-ac", "2", "-c:a", "flac", out_path]
     elif ext == "wav":
-        cmd = ["ffmpeg", "-y", "-i", input_path, "-vn", "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le", out_path]
+        cmd = [FFMPEG_BIN, "-y", "-i", input_path, "-vn", "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le", out_path]
     else:
-        cmd = ["ffmpeg", "-y", "-i", input_path, "-vn", "-ar", "44100", "-ac", "2", "-b:a", "320k", out_path]
+        cmd = [FFMPEG_BIN, "-y", "-i", input_path, "-vn", "-ar", "44100", "-ac", "2", "-b:a", "320k", out_path]
 
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=40, check=True)
     return out_path if os.path.exists(out_path) else ""
@@ -418,7 +416,7 @@ def embed_tags(file_path: str, meta: dict, cover_bytes: bytes = None):
             logger.warning(f"MP3 tagging warning: {e}")
 
 
-# ==================== ПОИСК ТОЛЬКО EXTENDED MIX (БЕЗ YOUTUBE И БЕЗ RADIO EDIT) ====================
+# ==================== ПОИСК ТОЛЬКО EXTENDED MIX ====================
 def normalize_for_match(s: str) -> str:
     s = re.sub(r"\([^\)]*\)|\[[^\]]*\]", "", (s or "").lower())
     s = re.sub(r"[^a-z0-9а-яё\s]", " ", s)
@@ -480,7 +478,6 @@ def download_extended_from_audiomack(meta: dict, target_format: str, tmp_dir: st
                 if dur < 60 or dur > 900:
                     continue
 
-                # Проверяем: это полный Extended Mix (разница с Beatport <= 20 сек) или урезанный Radio Edit?
                 is_extended_length = (expected_dur == 0) or (abs(dur - expected_dur) <= 20) or (dur >= expected_dur - 15)
 
                 if not is_extended_length and not allow_radio_fallback:
@@ -528,7 +525,6 @@ def process_download_request(url: str, meta: dict, target_format: str, tmp_dir: 
         except Exception:
             pass
 
-    # 1. Если пользователь прислал ПРЯМУЮ ссылку на SoundCloud / Bandcamp — качаем напрямую с неё
     if any(d in url.lower() for d in ("soundcloud.com", "on.soundcloud.com", "bandcamp.com")):
         raw_tmpl = os.path.join(tmp_dir, "direct_raw.%(ext)s")
         ydl_opts = {"format": "bestaudio/best", "outtmpl": raw_tmpl, "noplaylist": True, "quiet": True}
@@ -543,14 +539,12 @@ def process_download_request(url: str, meta: dict, target_format: str, tmp_dir: 
             embed_tags(out_file, meta, cover_bytes)
             return out_file, cover_path, int(info.get("duration") or 0)
 
-    # 2. Прямое скачивание с серверов Beatport API v4 (если задан аккаунт/токен Beatport)
     if meta.get("track_id"):
         bp_direct = download_direct_from_beatport_api(meta["track_id"], target_format, tmp_dir)
         if bp_direct and os.path.exists(bp_direct):
             embed_tags(bp_direct, meta, cover_bytes)
             return bp_direct, cover_path, int(meta.get("duration_sec") or 0)
 
-    # 3. Поиск строго полной Extended-версии (проверка совпадения длительности с Beatport!)
     out_file, found_dur = download_extended_from_audiomack(
         meta, target_format, tmp_dir, allow_radio_fallback=allow_radio_fallback
     )
@@ -568,8 +562,8 @@ def process_download_request(url: str, meta: dict, target_format: str, tmp_dir: 
         )
 
     raise RuntimeError(
-        f"Полная версия Extended Mix ({bp_dur_str}) доступна только напрямую с аккаунтом Beatport Streaming.\n\n"
-        f"💡 Подключите аккаунт командой:\n<code>/bp_login email пароль</code>\nили\n<code>/bp_token токен</code>"
+        f"Полная версия Extended Mix ({bp_dur_str}) закрыта эксклюзивом Beatport и не выложена лейблом в бесплатный доступ.\n\n"
+        f"💡 Для прямого скачивания с серверов Beatport подключите аккаунт:\n<code>/bp_login email пароль</code>\nили\n<code>/bp_token токен</code>"
     )
 
 
@@ -578,7 +572,7 @@ def process_download_request(url: str, meta: dict, target_format: str, tmp_dir: 
 async def cmd_start(message: types.Message):
     bp_status = "✅ Подключен (прямое скачивание Extended Mix с Beatport API v4)" if (
         _BP_AUTH_STATE["username"] or _BP_AUTH_STATE["access_token"]
-    ) else "⚠️ Не подключен (используется проверка длины Extended Mix)"
+    ) else "⚠️ Не подключен (включен фильтр против Radio Edit)"
 
     await message.answer(
         "🎧 <b>Musicvibez.org Beatport Downloader (PRO Edition)</b>\n\n"
@@ -618,7 +612,7 @@ async def cmd_bp_token(message: types.Message):
         return
     _BP_AUTH_STATE["access_token"] = parts[1].strip()
     _BP_AUTH_STATE["expires_at"] = 0
-    await message.answer("✅ <b>Bearer-токен Beatport сохранен!</b> Теперь бот будет запрашивать прямые потоки с api.beatport.com/v4.", parse_mode="HTML")
+    await message.answer("✅ <b>Bearer-токен Beatport сохранен!</b> Теперь бот запрашивает прямые потоки с api.beatport.com/v4.", parse_mode="HTML")
 
 
 @dp.message(F.text)
@@ -634,7 +628,6 @@ async def handle_link(message: types.Message):
 
     url = url_match.group(1)
 
-    # Если это прямая ссылка на SoundCloud — сразу спрашиваем формат и качаем с SoundCloud
     if "soundcloud.com" in url.lower():
         req_id = uuid.uuid4().hex[:10]
         _PENDING_TRACKS[req_id] = {
@@ -771,7 +764,7 @@ async def handle_format_callback(call: CallbackQuery):
                 inline_keyboard=[
                     [
                         InlineKeyboardButton(
-                            text=f"⬇️ Скачать Radio Edit ({radio_dur}) в {fmt.upper()}",
+                            text=f"⬇️ Всё равно скачать Radio Edit ({radio_dur}) в {fmt.upper()}",
                             callback_data=f"dl|{req_id}|{fmt}|1",
                         )
                     ]
@@ -780,9 +773,9 @@ async def handle_format_callback(call: CallbackQuery):
             await call.message.edit_text(
                 f"⚠️ <b>Внимание: фильтрация Radio Edit!</b>\n\n"
                 f"Трек <b>{clean_artist} – {clean_title}</b> на Beatport имеет длительность <b>{bp_dur} (Extended Mix)</b>, "
-                f"а лейбл выложил в открытые стриминги только урезанную <b>Radio Edit ({radio_dur})</b>.\n\n"
-                f"Бот заблокировал скачивание урезанной версии, чтобы не подменять Extended Mix.\n\n"
-                f"🔑 <i>Чтобы качать закрытые Extended Mix напрямую с серверов Beatport, подключите подписку Beatport Streaming командой</i> <code>/bp_login email пароль</code>.",
+                f"а в открытых стримингах лейбл выложил только урезанную <b>Radio Edit ({radio_dur})</b>.\n\n"
+                f"Бот остановил скачивание урезанной версии.\n\n"
+                f"🔑 <i>Чтобы выкачивать закрытые Extended Mix напрямую с серверов Beatport, подключите аккаунт Beatport Streaming командой</i> <code>/bp_login email пароль</code>.",
                 reply_markup=kb,
                 parse_mode="HTML",
             )
@@ -793,9 +786,31 @@ async def handle_format_callback(call: CallbackQuery):
         await call.message.edit_text(f"❌ {str(e)[:350]}", parse_mode="HTML")
 
 
+# ==================== HTTP HEALTHCHECK ДЛЯ BLITZ CLOUD ====================
+async def start_healthcheck_server():
+    """
+    Открывает HTTP-порт для Blitz Cloud, чтобы этап 'Starting it up' завершался мгновенно (за 0.1 сек)!
+    """
+    app = web.Application()
+    app.router.add_get("/", lambda req: web.json_response({"ok": True, "bot": "sweet_music_dl_bot"}))
+    app.router.add_get("/health", lambda req: web.json_response({"ok": True}))
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    ports = {int(os.environ.get("PORT", "8080")), 8080, 8000, 3000}
+    for p in ports:
+        try:
+            site = web.TCPSite(runner, "0.0.0.0", p)
+            await site.start()
+            logger.info(f"Healthcheck HTTP server listening on 0.0.0.0:{p}")
+        except Exception:
+            pass
+
+
 async def main():
+    await start_healthcheck_server()
     await bot.delete_webhook(drop_pending_updates=True)
-    logger.info("Бот успешно запущен!")
+    logger.info("Бот успешно запущен и слушает сообщения!")
     await dp.start_polling(bot)
 
 
