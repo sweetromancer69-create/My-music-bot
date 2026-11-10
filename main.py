@@ -6,652 +6,1564 @@ import uuid
 import hmac
 import base64
 import shutil
+import secrets
 import hashlib
 import asyncio
 import logging
 import tempfile
 import subprocess
 import urllib.parse
-from pathlib import Path
+from datetime import datetime, timedelta, timezone
+
 import requests
 from bs4 import BeautifulSoup
-import yt_dlp
 from aiohttp import web
-from mutagen.id3 import ID3, TIT2, TPE1, TALB, TBPM, TKEY, TCON, APIC, ID3NoHeaderError
-from mutagen.flac import FLAC, Picture
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+import yt_dlp
 
+from mutagen.id3 import (
+    ID3,
+    TIT2,
+    TPE1,
+    TALB,
+    TCON,
+    TDRC,
+    TPUB,
+    TBPM,
+    TKEY,
+    TSRC,
+    TXXX,
+    COMM,
+    APIC,
+    ID3NoHeaderError,
+)
+from mutagen.flac import FLAC, Picture
+
+# ==================== НАСТРОЙКИ И ЛОГИРОВАНИЕ ====================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("musicvibez_bot")
 
-# Автоматический поиск ffmpeg (системный или из пакета imageio-ffmpeg)
-FFMPEG_BIN = shutil.which("ffmpeg")
-if not FFMPEG_BIN:
-    try:
-        import imageio_ffmpeg
-        FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception:
-        FFMPEG_BIN = "ffmpeg"
-logger.info(f"Using FFMPEG binary: {FFMPEG_BIN}")
-
-# ==================== НАСТРОЙКИ ИЗ ОКРУЖЕНИЯ ====================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "963491961"))
-BEATPORT_USERNAME = os.environ.get("BEATPORT_USERNAME", "").strip()
-BEATPORT_PASSWORD = os.environ.get("BEATPORT_PASSWORD", "").strip()
-BEATPORT_TOKEN = os.environ.get("BEATPORT_TOKEN", "").strip()
-# ===============================================================
-
-if not BOT_TOKEN:
-    raise RuntimeError("ОШИБКА: Переменная BOT_TOKEN не задана в окружении!")
+DEFAULT_BOT_TOKEN = "8881412253:AAEUfdKH8VKEWPCXKk4AK8zH_p27Odi3278"
+env_token = os.getenv("BOT_TOKEN", "").strip()
+if not env_token or env_token.startswith("8881412253:AAELisPK"):
+    BOT_TOKEN = DEFAULT_BOT_TOKEN
+else:
+    BOT_TOKEN = env_token
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-BP_CLIENT_ID = "ryZ8LuyQVPqbK2mBX2Hwt4qSMtnWuTYSqBPO92yQ"
-BP_BASE_URL = "https://api.beatport.com/v4"
-
-AM_CONSUMER_KEY = "audiomack-web"
-AM_CONSUMER_SECRET = "bd8a07e9f23fbe9d808646b730f89b8e"
-
-_BP_AUTH_STATE = {
-    "username": BEATPORT_USERNAME,
-    "password": BEATPORT_PASSWORD,
-    "access_token": BEATPORT_TOKEN,
-    "refresh_token": "",
-    "expires_at": 0,
-}
-
+# Хранилище метаданных треков для кнопок выбора формата (req_id -> dict)
 _PENDING_TRACKS = {}
+# Последний ожидающий запрос пользователя (chat_id -> {"req_id": ..., "fmt": ..., "allow_radio": ...})
+# чтобы после вставки ссылки активации spotiflac:// бот автоматически докачал трек!
+_WAITING_FOR_GRANT = {}
+
+# ==================== MULTI-PLATFORM LOSSLESS GATEWAY (ZARZ V2) ====================
+# Поддерживает: Beatport (FLAC Lossless Extended Mix), Tidal (Hi-Res/FLAC), Qobuz (Hi-Res/FLAC),
+# Amazon Music (Ultra HD FLAC), Deezer (FLAC) без платных подписок!
+ZARZ_SESSION_FILE = "/tmp/zarz_v2_session.json"
+
+
+class ZarzVerificationRequired(Exception):
+    def __init__(self, auth_url: str, challenge_id: str = ""):
+        super().__init__("Требуется однократная активация Lossless-сервера (1 клик)")
+        self.auth_url = auth_url
+        self.challenge_id = challenge_id
+
+
+class ZarzV2Client:
+    BASE_URL = "https://api.zarz.moe/v2"
+    PLATFORM = "extension"
+    APP_VERSION = "beatport@1.0.0"
+
+    def __init__(self):
+        self.http = requests.Session()
+        self.install_id = ""
+        self.session_id = ""
+        self.session_secret = ""
+        self.expires_at = ""
+        self.refresh_after = ""
+        self.pending_challenge_id = ""
+        self.pending_auth_url = ""
+        self._load()
+
+    def _load(self):
+        raw_env = os.getenv("ZARZ_SESSION_JSON", "").strip()
+        data = {}
+        if os.path.exists(ZARZ_SESSION_FILE):
+            try:
+                with open(ZARZ_SESSION_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+        elif raw_env:
+            try:
+                data = json.loads(raw_env)
+            except Exception:
+                data = {}
+        self.install_id = data.get("install_id") or secrets.token_hex(16)
+        self.session_id = data.get("session_id") or ""
+        self.session_secret = data.get("session_secret") or ""
+        self.expires_at = data.get("expires_at") or ""
+        self.refresh_after = data.get("refresh_after") or ""
+        self._save()
+
+    def _save(self):
+        try:
+            with open(ZARZ_SESSION_FILE, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "install_id": self.install_id,
+                        "session_id": self.session_id,
+                        "session_secret": self.session_secret,
+                        "expires_at": self.expires_at,
+                        "refresh_after": self.refresh_after,
+                    },
+                    f,
+                )
+        except Exception:
+            pass
+
+    def clear(self):
+        self.session_id = ""
+        self.session_secret = ""
+        self.expires_at = ""
+        self.refresh_after = ""
+        self._save()
+
+    @staticmethod
+    def _parse_time(val: str):
+        if not val:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    def is_valid(self) -> bool:
+        if not self.session_id or not self.session_secret:
+            return False
+        exp = self._parse_time(self.expires_at)
+        if not exp:
+            return False
+        return exp > datetime.now(timezone.utc) + timedelta(minutes=2)
+
+    def bootstrap_challenge_url(self) -> str:
+        resp = self.http.get(
+            f"{self.BASE_URL}/bootstrap",
+            params={"install_id": self.install_id, "app_version": self.APP_VERSION},
+            headers={
+                "Accept": "application/json",
+                "User-Agent": f"SpotiFLAC-Mobile/{self.APP_VERSION}",
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if all(data.get(k) for k in ("session_id", "session_secret", "expires_at")):
+            self.session_id = str(data["session_id"])
+            self.session_secret = str(data["session_secret"])
+            self.expires_at = str(data["expires_at"])
+            self.refresh_after = str(data.get("refresh_after") or "")
+            self.pending_auth_url = ""
+            self.pending_challenge_id = ""
+            self._save()
+            return ""
+        cid = str(data.get("challenge_id") or "")
+        callback = "spotiflac://session-grant?" + urllib.parse.urlencode(
+            {"cb_version": "v2grant", "state": "zarz-v2"}
+        )
+        auth_url = f"{self.BASE_URL}/challenge?" + urllib.parse.urlencode({"id": cid, "cb": callback})
+        self.pending_challenge_id = cid
+        self.pending_auth_url = auth_url
+        return auth_url
+
+    def exchange_grant(self, raw_grant_or_url: str) -> bool:
+        text = (raw_grant_or_url or "").strip()
+        grant = text
+        if "grant=" in text:
+            m = re.search(r"[?&]grant=([^&#\s]+)", text)
+            if m:
+                grant = urllib.parse.unquote(m.group(1))
+        grant = grant.strip()
+        if not grant:
+            raise ValueError("Не удалось извлечь grant-токен из ссылки")
+
+        resp = self.http.post(
+            f"{self.BASE_URL}/session/exchange",
+            json={
+                "grant": grant,
+                "install_id": self.install_id,
+                "app_version": self.APP_VERSION,
+                "platform": self.PLATFORM,
+            },
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": f"SpotiFLAC-Mobile/{self.APP_VERSION}",
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not all(data.get(k) for k in ("session_id", "session_secret", "expires_at")):
+            raise RuntimeError(f"Неполный ответ сервера при обмене токена: {data}")
+        self.session_id = str(data["session_id"])
+        self.session_secret = str(data["session_secret"])
+        self.expires_at = str(data["expires_at"])
+        self.refresh_after = str(data.get("refresh_after") or "")
+        self.pending_auth_url = ""
+        self.pending_challenge_id = ""
+        self._save()
+        logger.info(f"ZarzV2 session activated until {self.expires_at}")
+        return True
+
+    def _sign_headers(self, method: str, path: str, body_bytes: bytes, app_version: str = None) -> dict:
+        app_ver = app_version or self.APP_VERSION
+        now = datetime.now(timezone.utc)
+        ts = now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
+        nonce = secrets.token_hex(12)
+        body_hash = hashlib.sha256(body_bytes).hexdigest()
+        window = int(time.time() // 300)
+
+        rk_bytes = hmac.new(
+            self.session_secret.encode("utf-8"),
+            f"{window}:{self.session_id}".encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+        rk_str = base64.urlsafe_b64encode(rk_bytes).rstrip(b"=").decode("utf-8")
+
+        full_url = f"{self.BASE_URL}/{path.lstrip('/')}"
+        parsed_path = urllib.parse.urlparse(full_url).path
+
+        signing_input = "\n".join(
+            [
+                "ZARZ-HMAC-V1",
+                method.upper(),
+                parsed_path,
+                "",
+                body_hash,
+                ts,
+                nonce,
+                self.session_id,
+                app_ver,
+                self.PLATFORM,
+            ]
+        )
+        sig = (
+            base64.urlsafe_b64encode(
+                hmac.new(
+                    rk_str.encode("utf-8"),
+                    signing_input.encode("utf-8"),
+                    hashlib.sha256,
+                ).digest()
+            )
+            .rstrip(b"=")
+            .decode("utf-8")
+        )
+        return {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": f"SpotiFLAC-Mobile/{app_ver}",
+            "X-Zarz-Session": self.session_id,
+            "X-Zarz-Timestamp": ts,
+            "X-Zarz-Nonce": nonce,
+            "X-Zarz-Body-Sha256": body_hash,
+            "X-Zarz-Signature": sig,
+            "X-Zarz-App-Version": app_ver,
+            "X-Zarz-Platform": self.PLATFORM,
+        }
+
+    def ensure_session(self):
+        if not self.is_valid():
+            auth_url = self.bootstrap_challenge_url()
+            if auth_url:
+                raise ZarzVerificationRequired(auth_url, self.pending_challenge_id)
+        # Проверяем необходимость продления сессии
+        exp = self._parse_time(self.expires_at)
+        ref = self._parse_time(self.refresh_after)
+        now = datetime.now(timezone.utc)
+        if (ref and now >= ref) or (exp and (exp - now) <= timedelta(hours=1)):
+            try:
+                body_bytes = json.dumps({"install_id": self.install_id}, separators=(",", ":")).encode("utf-8")
+                headers = self._sign_headers("POST", "/session/refresh", body_bytes)
+                r = self.http.post(f"{self.BASE_URL}/session/refresh", data=body_bytes, headers=headers, timeout=15)
+                if r.status_code == 200:
+                    d = r.json()
+                    if d.get("session_id") and d.get("session_secret"):
+                        self.session_id = str(d["session_id"])
+                        self.session_secret = str(d["session_secret"])
+                        self.expires_at = str(d.get("expires_at") or self.expires_at)
+                        self.refresh_after = str(d.get("refresh_after") or self.refresh_after)
+                        self._save()
+            except Exception as e:
+                logger.warning(f"Session refresh warning: {e}")
+
+    def signed_post(self, path: str, payload: dict, extra_headers: dict = None, app_version: str = None) -> dict:
+        self.ensure_session()
+        body_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        headers = self._sign_headers("POST", path, body_bytes, app_version=app_version)
+        if extra_headers:
+            headers.update(extra_headers)
+        url = f"{self.BASE_URL}/{path.lstrip('/')}"
+        resp = self.http.post(url, data=body_bytes, headers=headers, timeout=35)
+        if resp.status_code in (401, 428):
+            try:
+                err_data = resp.json()
+            except Exception:
+                err_data = {}
+            code = str(err_data.get("code") or "").upper()
+            if "SESSION" in code or "AUTH" in code or "VERIFY" in code or resp.status_code == 428:
+                self.clear()
+                auth_url = self.bootstrap_challenge_url()
+                if auth_url:
+                    raise ZarzVerificationRequired(auth_url, self.pending_challenge_id)
+        if resp.status_code != 200:
+            try:
+                err_json = resp.json()
+                err_msg = err_json.get("error") or err_json.get("detail") or err_json.get("message") or resp.text[:200]
+            except Exception:
+                err_msg = resp.text[:200]
+            raise RuntimeError(f"Ошибка Lossless-шлюза ({resp.status_code}): {err_msg}")
+        return resp.json()
+
+    def get_ticket(self, provider: str, resource_str: str, app_version: str = None) -> str:
+        res_hash = hashlib.sha256(resource_str.encode("utf-8")).hexdigest()
+        data = self.signed_post(
+            "/tickets",
+            {
+                "capability": "download_ticket",
+                "provider": provider,
+                "resource_hash": res_hash,
+            },
+            app_version=app_version,
+        )
+        tid = str(data.get("ticket_id") or data.get("ticket") or "").strip()
+        if not tid:
+            raise RuntimeError(f"Не получен download_ticket для {provider}")
+        return tid
+
+    # 1. BEATPORT DIRECT LOSSLESS (Extended Mix FLAC / AAC 256)
+    def download_beatport_track(self, track_id: str, target_format: str, tmp_dir: str) -> str:
+        tid = str(track_id).strip()
+        quality = "lossless"
+        ticket_id = self.get_ticket("btp", f"beatport:track:{tid}", app_version="beatport@1.0.0")
+        res = self.signed_post(
+            "/dl/btp",
+            {"id": tid, "quality": quality, "allow_fallback": False},
+            extra_headers={"X-Zarz-Ticket": ticket_id},
+            app_version="beatport@1.0.0",
+        )
+        dl_url = str(res.get("download_url") or "").strip()
+        if not dl_url:
+            raise RuntimeError("Сервер Beatport не вернул download_url")
+        ext = str(res.get("format") or "flac").lower()
+        raw_path = os.path.join(tmp_dir, f"bp_zarz_{tid}.{ext}")
+        with self.http.get(dl_url, headers={"User-Agent": "SpotiFLAC-Mobile/beatport@1.0.0"}, stream=True, timeout=60) as r:
+            r.raise_for_status()
+            with open(raw_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=131072):
+                    if chunk:
+                        f.write(chunk)
+        return convert_audio_to_format(raw_path, target_format, tmp_dir)
+
+    # 2. TIDAL LOSSLESS / HI-RES FLAC
+    def download_tidal_track(self, track_id: str, target_format: str, tmp_dir: str) -> str:
+        tid = str(track_id).strip()
+        for q_tier in ("HI_RES_LOSSLESS", "LOSSLESS"):
+            try:
+                ticket_id = self.get_ticket("tid", f"tid:track:{tid.lower()}", app_version="tidal-web@1.2.5")
+                payload = self.signed_post(
+                    "/dl/tid",
+                    {"id": tid, "quality": q_tier},
+                    extra_headers={"X-Zarz-Ticket": ticket_id},
+                    app_version="tidal-web@1.2.5",
+                )
+                data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+                manifest_b64 = data.get("manifest") if isinstance(data, dict) else None
+                if not manifest_b64:
+                    continue
+                manifest_text = base64.b64decode(manifest_b64).decode("utf-8", errors="ignore").strip()
+                if manifest_text.startswith("{"):
+                    bts = json.loads(manifest_text)
+                    urls = bts.get("urls") or []
+                    if not urls:
+                        continue
+                    raw_path = os.path.join(tmp_dir, f"tidal_{tid}.flac")
+                    with self.http.get(urls[0], headers=HEADERS, stream=True, timeout=60) as r:
+                        r.raise_for_status()
+                        with open(raw_path, "wb") as f:
+                            for chunk in r.iter_content(chunk_size=131072):
+                                if chunk:
+                                    f.write(chunk)
+                    return convert_audio_to_format(raw_path, target_format, tmp_dir)
+                else:
+                    # DASH MPD manifest (Hi-Res 24-bit FLAC insegmented MP4)
+                    init_m = re.search(r'initialization="([^"]+)"', manifest_text, re.I)
+                    media_m = re.search(r'media="([^"]+)"', manifest_text, re.I)
+                    if not init_m or not media_m:
+                        continue
+                    init_url = init_m.group(1).replace("&amp;", "&")
+                    media_tpl = media_m.group(1).replace("&amp;", "&")
+                    seg_count = 0
+                    for sm in re.finditer(r'<S\s+[^>]*d="(\d+)"(?:\s+r="(-?\d+)")?', manifest_text, re.I):
+                        rep = int(sm.group(2) or "0")
+                        seg_count += max(0, rep) + 1
+                    if seg_count <= 0:
+                        continue
+                    raw_m4a = os.path.join(tmp_dir, f"tidal_dash_{tid}.m4a")
+                    with open(raw_m4a, "wb") as out_f:
+                        r_init = self.http.get(init_url, headers=HEADERS, timeout=25)
+                        r_init.raise_for_status()
+                        out_f.write(r_init.content)
+                        for idx in range(1, seg_count + 1):
+                            seg_url = media_tpl.replace("$Number$", str(idx))
+                            r_seg = self.http.get(seg_url, headers=HEADERS, timeout=25)
+                            r_seg.raise_for_status()
+                            out_f.write(r_seg.content)
+                    return convert_audio_to_format(raw_m4a, target_format, tmp_dir)
+            except ZarzVerificationRequired:
+                raise
+            except Exception as e:
+                logger.warning(f"Tidal tier {q_tier} warning for {tid}: {e}")
+        raise RuntimeError("Не удалось скачать трек с Tidal")
+
+    # 3. QOBUZ HI-RES / LOSSLESS FLAC
+    def download_qobuz_track(self, track_id: str, target_format: str, tmp_dir: str) -> str:
+        tid = str(track_id).strip()
+        track_url = f"https://open.qobuz.com/track/{tid}"
+        for q_code in ("hi-res-max", "hi-res", "cd"):
+            try:
+                ticket_id = self.get_ticket("qbz", f"qbz:track:{track_url.lower()}", app_version="qobuz-web@1.1.0")
+                res = self.signed_post(
+                    "/dl/qbz",
+                    {
+                        "quality": q_code,
+                        "upload_to_r2": False,
+                        "id": tid,
+                        "type": "track",
+                        "url": track_url,
+                    },
+                    extra_headers={"X-Zarz-Ticket": ticket_id},
+                    app_version="qobuz-web@1.1.0",
+                )
+                nested = res.get("data") if isinstance(res.get("data"), dict) else {}
+                dl_url = (
+                    res.get("download_url")
+                    or res.get("url")
+                    or res.get("link")
+                    or nested.get("download_url")
+                    or nested.get("url")
+                    or nested.get("link")
+                )
+                if not dl_url:
+                    continue
+                raw_path = os.path.join(tmp_dir, f"qobuz_{tid}.flac")
+                with self.http.get(str(dl_url), headers=HEADERS, stream=True, timeout=60) as r:
+                    r.raise_for_status()
+                    with open(raw_path, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=131072):
+                            if chunk:
+                                f.write(chunk)
+                return convert_audio_to_format(raw_path, target_format, tmp_dir)
+            except ZarzVerificationRequired:
+                raise
+            except Exception as e:
+                logger.warning(f"Qobuz tier {q_code} warning for {tid}: {e}")
+        raise RuntimeError("Не удалось скачать трек с Qobuz")
+
+    # 4. AMAZON MUSIC ULTRA HD / HD FLAC
+    def download_amazon_track(self, asin: str, target_format: str, tmp_dir: str) -> tuple:
+        clean_asin = str(asin).strip().upper()
+        ticket_id = self.get_ticket(
+            "amazeamazeamaze",
+            f"amazeamazeamaze:track:{clean_asin.lower()}",
+            app_version="amzn@2.3.12",
+        )
+        data = self.signed_post(
+            "/dl/amazeamazeamaze",
+            {"asin": clean_asin, "codec": "flac"},
+            extra_headers={"X-Zarz-Ticket": ticket_id},
+            app_version="amzn@2.3.12",
+        )
+        if isinstance(data, list) and data:
+            data = data[0]
+        if not isinstance(data, dict) or not data.get("audio") or not data["audio"].get("url"):
+            raise RuntimeError("Сервер Amazon Music не вернул аудио-поток")
+
+        stream_url = str(data["audio"]["url"]).strip()
+        dec_key = str(data["audio"].get("key") or "").strip()
+        amz_meta = data.get("meta") or {}
+        cover_tpl = str(data.get("cover") or "")
+        cover_url = (
+            cover_tpl.replace("{size}", "1400").replace("{jpegQuality}", "95").replace("{format}", "jpg")
+            if cover_tpl
+            else ""
+        )
+
+        ext = "m4a" if dec_key else "flac"
+        raw_path = os.path.join(tmp_dir, f"amazon_{clean_asin}.{ext}")
+        with self.http.get(stream_url, headers=HEADERS, stream=True, timeout=60) as r:
+            r.raise_for_status()
+            with open(raw_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=131072):
+                    if chunk:
+                        f.write(chunk)
+
+        if dec_key and shutil.which("ffmpeg"):
+            decrypted_flac = os.path.join(tmp_dir, f"amazon_dec_{clean_asin}.flac")
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-decryption_key",
+                    dec_key,
+                    "-i",
+                    raw_path,
+                    "-c:a",
+                    "flac",
+                    decrypted_flac,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=60,
+            )
+            if os.path.exists(decrypted_flac) and os.path.getsize(decrypted_flac) > 50_000:
+                raw_path = decrypted_flac
+
+        extra_meta = {
+            "title": amz_meta.get("title") or "",
+            "artist": amz_meta.get("artist") or amz_meta.get("albumArtist") or "",
+            "album": amz_meta.get("album") or "",
+            "isrc": amz_meta.get("isrc") or "",
+            "genre": amz_meta.get("genre") or "",
+            "label": amz_meta.get("label") or "",
+            "release_date": amz_meta.get("date") or amz_meta.get("releaseDate") or "",
+            "cover_url": cover_url,
+        }
+        return convert_audio_to_format(raw_path, target_format, tmp_dir), extra_meta
+
+    # 5. DEEZER LOSSLESS FLAC
+    def download_deezer_track(self, track_id: str, target_format: str, tmp_dir: str) -> str:
+        tid = str(track_id).strip()
+        track_url = f"https://www.deezer.com/track/{tid}"
+        ticket_id = self.get_ticket("dzr", f"dzr:track:{track_url.lower()}", app_version="deezer@1.3.5")
+        desc = self.signed_post(
+            "/dl/dzr",
+            {"id": tid, "type": "track", "platform": "deezer", "url": track_url},
+            extra_headers={"X-Zarz-Ticket": ticket_id},
+            app_version="deezer@1.3.5",
+        )
+        dl_url = str(desc.get("direct_download_url") or desc.get("download_url") or "").strip()
+        if not dl_url:
+            raise RuntimeError("Deezer не вернул ссылку на скачивание")
+        raw_path = os.path.join(tmp_dir, f"deezer_{tid}.flac")
+        with self.http.get(dl_url, headers=HEADERS, stream=True, timeout=60) as r:
+            r.raise_for_status()
+            with open(raw_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=131072):
+                    if chunk:
+                        f.write(chunk)
+        return convert_audio_to_format(raw_path, target_format, tmp_dir)
+
+
+ZARZ_CLIENT = ZarzV2Client()
+
+# ==================== BEATPORT PERSONAL ACCOUNT FALLBACK (API v4) ====================
+BEATPORT_CLIENT_ID = "ryZ8LuyQVPqbK2mBX2Hwt4qSMtnWuTYSqBPO92yQ"
+BEATPORT_API_BASE = "https://api.beatport.com/v4"
+BEATPORT_REDIRECT_URI = f"{BEATPORT_API_BASE}/auth/o/post-message/"
+BP_CREDS_FILE = "/tmp/bp_credentials.json"
+_BP_TOKEN_CACHE = {"access_token": os.getenv("BEATPORT_TOKEN", "").strip(), "expires_at": 0}
 
 
 def format_mm_ss(seconds: int) -> str:
-    if seconds <= 0:
+    if not seconds or seconds <= 0:
         return "—"
     m, s = divmod(int(seconds), 60)
     return f"{m:02d}:{s:02d}"
 
 
-# ==================== BEATPORT API v4 DIRECT ENGINE ====================
 def bp_login_and_get_token() -> str:
     now = time.time()
-    if _BP_AUTH_STATE["access_token"] and (_BP_AUTH_STATE["expires_at"] == 0 or now < _BP_AUTH_STATE["expires_at"] - 60):
-        return _BP_AUTH_STATE["access_token"]
+    if _BP_TOKEN_CACHE.get("access_token") and _BP_TOKEN_CACHE.get("expires_at", 0) > now + 60:
+        return _BP_TOKEN_CACHE["access_token"]
 
-    if _BP_AUTH_STATE["refresh_token"]:
+    username = os.getenv("BEATPORT_USERNAME", "").strip()
+    password = os.getenv("BEATPORT_PASSWORD", "").strip()
+    saved_token = os.getenv("BEATPORT_TOKEN", "").strip()
+
+    if os.path.exists(BP_CREDS_FILE):
         try:
-            r = requests.post(
-                f"{BP_BASE_URL}/auth/o/token/",
-                data={
-                    "client_id": BP_CLIENT_ID,
-                    "refresh_token": _BP_AUTH_STATE["refresh_token"],
-                    "grant_type": "refresh_token",
-                },
-                headers=HEADERS,
-                timeout=12,
-            )
-            if r.ok:
-                d = r.json()
-                _BP_AUTH_STATE["access_token"] = d.get("access_token", "")
-                _BP_AUTH_STATE["refresh_token"] = d.get("refresh_token", _BP_AUTH_STATE["refresh_token"])
-                _BP_AUTH_STATE["expires_at"] = now + int(d.get("expires_in", 3600))
-                return _BP_AUTH_STATE["access_token"]
-        except Exception as e:
-            logger.warning(f"Beatport token refresh error: {e}")
+            with open(BP_CREDS_FILE, "r", encoding="utf-8") as f:
+                creds = json.load(f)
+                username = creds.get("username") or username
+                password = creds.get("password") or password
+                saved_token = creds.get("access_token") or saved_token
+        except Exception:
+            pass
 
-    username = _BP_AUTH_STATE["username"]
-    password = _BP_AUTH_STATE["password"]
+    if saved_token and not username:
+        return saved_token
     if not username or not password:
         return ""
 
-    try:
-        sess = requests.Session()
-        sess.headers.update(HEADERS)
-        login_r = sess.post(
-            f"{BP_BASE_URL}/auth/login/",
-            json={"username": username, "password": password},
-            timeout=12,
-        )
-        if not login_r.ok:
-            logger.warning(f"Beatport login failed ({login_r.status_code}): {login_r.text[:200]}")
-            return ""
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    r_login = s.post(
+        f"{BEATPORT_API_BASE}/auth/login/",
+        json={"username": username, "password": password},
+        timeout=15,
+    )
+    if r_login.status_code != 200:
+        raise ValueError(f"Ошибка входа в Beatport ({r_login.status_code})")
 
-        auth_r = sess.get(
-            f"{BP_BASE_URL}/auth/o/authorize/?client_id={BP_CLIENT_ID}&response_type=code",
-            allow_redirects=False,
-            timeout=12,
-        )
-        loc = auth_r.headers.get("Location", "")
-        parsed = urllib.parse.urlparse(loc)
-        code = urllib.parse.parse_qs(parsed.query).get("code", [""])[0]
-        if not code:
-            logger.warning("Beatport authorize did not return code")
-            return ""
+    r_auth = s.get(
+        f"{BEATPORT_API_BASE}/auth/o/authorize/",
+        params={
+            "response_type": "code",
+            "client_id": BEATPORT_CLIENT_ID,
+            "redirect_uri": BEATPORT_REDIRECT_URI,
+        },
+        allow_redirects=False,
+        timeout=15,
+    )
+    loc = r_auth.headers.get("Location", "")
+    parsed_q = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)
+    code = parsed_q.get("code", [""])[0]
+    if not code:
+        raise ValueError("Не удалось получить OAuth code от Beatport API v4.")
 
-        tok_r = sess.post(
-            f"{BP_BASE_URL}/auth/o/token/",
-            data={
-                "client_id": BP_CLIENT_ID,
-                "grant_type": "authorization_code",
-                "code": code,
-            },
-            timeout=12,
-        )
-        if tok_r.ok:
-            d = tok_r.json()
-            _BP_AUTH_STATE["access_token"] = d.get("access_token", "")
-            _BP_AUTH_STATE["refresh_token"] = d.get("refresh_token", "")
-            _BP_AUTH_STATE["expires_at"] = now + int(d.get("expires_in", 3600))
-            return _BP_AUTH_STATE["access_token"]
-    except Exception as e:
-        logger.warning(f"Beatport direct auth error: {e}")
-
-    return ""
+    r_tok = s.post(
+        f"{BEATPORT_API_BASE}/auth/o/token/",
+        data={
+            "code": code,
+            "grant_type": "authorization_code",
+            "redirect_uri": BEATPORT_REDIRECT_URI,
+            "client_id": BEATPORT_CLIENT_ID,
+        },
+        timeout=15,
+    )
+    tok_data = r_tok.json()
+    access_token = tok_data.get("access_token", "")
+    expires_in = int(tok_data.get("expires_in", 3600))
+    _BP_TOKEN_CACHE["access_token"] = access_token
+    _BP_TOKEN_CACHE["expires_at"] = now + expires_in
+    return access_token
 
 
 def download_direct_from_beatport_api(track_id: str, target_format: str, tmp_dir: str) -> str:
     token = bp_login_and_get_token()
-    if not token or not track_id:
-        return ""
-
+    if not token:
+        return None
     auth_headers = {**HEADERS, "Authorization": f"Bearer {token}"}
     bp_quality = "lossless" if target_format in ("flac", "wav") else "high"
-
-    stream_location = ""
     for q in ([bp_quality, "high"] if bp_quality == "lossless" else ["high", "lossless"]):
-        try:
-            r = requests.get(
-                f"{BP_BASE_URL}/catalog/tracks/{track_id}/download/?quality={q}",
-                headers=auth_headers,
-                timeout=12,
-            )
-            if r.ok:
-                d = r.json()
-                stream_location = d.get("location") or d.get("stream_url") or ""
-                if stream_location:
-                    break
-        except Exception as e:
-            logger.warning(f"Beatport /download/ error: {e}")
-
-    if not stream_location:
-        try:
-            r = requests.get(
-                f"{BP_BASE_URL}/catalog/tracks/{track_id}/stream/",
-                headers=auth_headers,
-                timeout=12,
-            )
-            if r.ok:
-                d = r.json()
-                stream_location = d.get("stream_url") or d.get("location") or ""
-        except Exception as e:
-            logger.warning(f"Beatport /stream/ error: {e}")
-
-    if not stream_location:
-        return ""
-
-    raw_path = os.path.join(tmp_dir, "bp_direct_raw.audio")
-    with requests.get(stream_location, headers=HEADERS, stream=True, timeout=30) as sr:
-        sr.raise_for_status()
-        with open(raw_path, "wb") as f:
-            for chunk in sr.iter_content(chunk_size=65536):
-                if chunk:
-                    f.write(chunk)
-
-    return convert_audio_to_format(raw_path, target_format, tmp_dir)
+        r = requests.get(
+            f"{BEATPORT_API_BASE}/catalog/tracks/{track_id}/download/",
+            params={"quality": q},
+            headers=auth_headers,
+            timeout=20,
+        )
+        if r.status_code == 200:
+            dl_url = r.json().get("location") or r.json().get("download_url")
+            if dl_url:
+                ext = "flac" if q == "lossless" else "mp3"
+                raw_path = os.path.join(tmp_dir, f"bp_direct_{track_id}.{ext}")
+                with requests.get(dl_url, headers=HEADERS, stream=True, timeout=45) as sr:
+                    sr.raise_for_status()
+                    with open(raw_path, "wb") as f:
+                        for chunk in sr.iter_content(chunk_size=131072):
+                            if chunk:
+                                f.write(chunk)
+                return convert_audio_to_format(raw_path, target_format, tmp_dir)
+    return None
 
 
-# ==================== ПАРСИНГ МЕТАДАННЫХ BEATPORT ====================
+# ==================== ПАРСИНГ МЕТАДАННЫХ С BEATPORT / TIDAL / QOBUZ / AMAZON / DEEZER ====================
 def clean_beatport_title(raw_text: str):
-    cleaned = raw_text
-    cleaned = re.sub(r'\|\s*Music\s*&?\s*Downloads\s*on\s*Beatport.*$', '', cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r'\|\s*Beatport.*$', '', cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r'\s+on\s+Beatport.*$', '', cleaned, flags=re.IGNORECASE)
-    cleaned = cleaned.strip()
-
-    label = ""
-    label_match = re.search(r'\[([^\]]+)\]\s*$', cleaned)
-    if label_match:
-        label = label_match.group(1).strip()
-        cleaned = re.sub(r'\s*\[[^\]]+\]\s*$', '', cleaned).strip()
-
-    artist = ""
-    title = cleaned
-    if " - " in cleaned:
-        parts = cleaned.split(" - ", 1)
-        artist = parts[0].strip()
-        title = parts[1].strip()
-
-    return artist, title, label
+    if not raw_text:
+        return None, None
+    txt = re.sub(r"\s*\|\s*Beatport.*$", "", raw_text, flags=re.IGNORECASE)
+    txt = re.sub(r"\s*-\s*Music\s*&\s*Downloads\s*on\s*Beatport.*$", "", txt, flags=re.IGNORECASE).strip()
+    if " - " in txt:
+        parts = txt.split(" - ", 1)
+        return parts[0].strip(), parts[1].strip()
+    return None, txt.strip()
 
 
 def parse_beatport(url: str) -> dict:
     meta = {
-        "track_id": "",
-        "title": "",
-        "artist": "",
-        "mix": "",
-        "label": "",
-        "catalog": "",
-        "genre": "",
-        "bpm": "",
-        "key": "",
-        "release_date": "",
-        "isrc": "",
-        "duration_sec": 0,
-        "cover_url": "",
+        "platform": "beatport",
+        "track_id": None,
+        "artist": None,
+        "title": None,
+        "mix": None,
+        "album": None,
+        "label": None,
+        "catalog": None,
+        "genre": None,
+        "bpm": None,
+        "key": None,
+        "isrc": None,
+        "release_date": None,
+        "cover_url": None,
+        "duration_sec": None,
         "is_exclusive": False,
     }
-    id_match = re.search(r"/track/[^/]+/(\d+)", url)
-    if id_match:
-        meta["track_id"] = id_match.group(1)
+    m_id = re.search(r"/track/[^/]+/(\d+)", url)
+    if m_id:
+        meta["track_id"] = m_id.group(1)
 
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=12)
-        if resp.ok:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            next_script = soup.find("script", id="__NEXT_DATA__")
-            if next_script and next_script.string:
-                try:
-                    data = json.loads(next_script.string)
-                    page_props = data.get("props", {}).get("pageProps", {})
-                    t_info = page_props.get("track")
-                    if not isinstance(t_info, dict):
-                        t_info = None
-                        queries = page_props.get("dehydratedState", {}).get("queries", [])
-                        for q in queries:
-                            sd = q.get("state", {}).get("data", {})
-                            if isinstance(sd, dict):
-                                cand = sd.get("track") if "track" in sd else sd
-                                if isinstance(cand, dict) and (cand.get("name") or cand.get("track_name")):
-                                    t_info = cand
-                                    break
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
 
-                    if isinstance(t_info, dict):
-                        if t_info.get("track_id") or t_info.get("id"):
-                            meta["track_id"] = str(t_info.get("track_id") or t_info.get("id"))
-                        meta["title"] = t_info.get("track_name") or t_info.get("name") or ""
-                        meta["mix"] = t_info.get("mix_name") or ""
-                        artists_list = t_info.get("artists", [])
-                        if isinstance(artists_list, list):
-                            meta["artist"] = ", ".join(
-                                [a.get("name", "") for a in artists_list if isinstance(a, dict) and a.get("name")]
-                            )
-                        if t_info.get("bpm"):
-                            meta["bpm"] = str(t_info.get("bpm"))
+        next_script = soup.find("script", id="__NEXT_DATA__")
+        if next_script and next_script.string:
+            data = json.loads(next_script.string)
+            track = data.get("props", {}).get("pageProps", {}).get("track")
+            if isinstance(track, dict):
+                meta["track_id"] = str(track.get("id") or meta["track_id"] or "")
+                meta["title"] = (track.get("name") or "").strip()
+                meta["mix"] = (track.get("mix_name") or "").strip()
 
-                        length_ms = int(t_info.get("track_length_ms") or t_info.get("length_ms") or 0)
-                        if length_ms > 0:
-                            meta["duration_sec"] = round(length_ms / 1000)
+                artists = [a.get("name", "").strip() for a in track.get("artists", []) if a.get("name")]
+                if artists:
+                    meta["artist"] = ", ".join(artists)
 
-                        key_val = t_info.get("key")
-                        camelot_val = t_info.get("key_camelot")
-                        key_str = key_val.get("name", "") if isinstance(key_val, dict) else (key_val if isinstance(key_val, str) else "")
-                        meta["key"] = f"{key_str} ({camelot_val})" if (key_str and camelot_val) else (key_str or str(camelot_val or ""))
+                release = track.get("release") or {}
+                if isinstance(release, dict):
+                    meta["album"] = release.get("name")
+                    label = release.get("label") or {}
+                    if isinstance(label, dict):
+                        meta["label"] = label.get("name")
+                    img = release.get("image") or {}
+                    if isinstance(img, dict):
+                        uri = img.get("uri") or img.get("dynamic_uri") or ""
+                        if "{w}" in uri:
+                            uri = uri.replace("{w}", "1400").replace("{h}", "1400")
+                        meta["cover_url"] = uri
 
-                        meta["isrc"] = t_info.get("isrc") or ""
+                if not meta["label"] and isinstance(track.get("label"), dict):
+                    meta["label"] = track["label"].get("name")
 
-                        price_cats = (t_info.get("price") or {}).get("category") or []
-                        if isinstance(price_cats, list) and "exclusive" in price_cats:
-                            meta["is_exclusive"] = True
+                genre = track.get("genre") or {}
+                if isinstance(genre, dict):
+                    meta["genre"] = genre.get("name")
 
-                        genre_obj = t_info.get("genre")
-                        if isinstance(genre_obj, dict):
-                            meta["genre"] = genre_obj.get("name", "")
+                if track.get("bpm"):
+                    meta["bpm"] = str(track["bpm"])
 
-                        rel_obj = t_info.get("release") or {}
-                        if isinstance(rel_obj, dict):
-                            meta["catalog"] = rel_obj.get("catalog_number") or ""
-                            r_date = rel_obj.get("release_date") or ""
-                            meta["release_date"] = r_date.split("T")[0] if "T" in r_date else r_date
-                            img_u = rel_obj.get("image_url") or ""
-                            if not img_u and isinstance(rel_obj.get("image"), dict):
-                                img_u = rel_obj["image"].get("uri") or rel_obj["image"].get("dynamic_uri") or ""
-                            if img_u:
-                                meta["cover_url"] = img_u.replace("{w}", "1400").replace("{h}", "1400")
+                key_obj = track.get("key") or {}
+                if isinstance(key_obj, dict) and key_obj.get("name"):
+                    meta["key"] = key_obj.get("name")
 
-                        lbl_obj = t_info.get("label") or (rel_obj.get("label") if isinstance(rel_obj, dict) else {})
-                        if isinstance(lbl_obj, dict):
-                            meta["label"] = lbl_obj.get("name", "")
-                except Exception as ex:
-                    logger.warning(f"Error parsing Beatport __NEXT_DATA__: {ex}")
+                meta["isrc"] = track.get("isrc")
+                meta["catalog"] = track.get("catalog_number")
+                meta["release_date"] = track.get("publish_date") or track.get("new_release_date")
+                meta["is_exclusive"] = bool(track.get("exclusive"))
 
-            og_title = soup.find("meta", property="og:title") or soup.find("meta", attrs={"name": "og:title"})
-            if og_title and og_title.get("content"):
-                parsed_artist, parsed_title, parsed_label = clean_beatport_title(og_title["content"])
-                if not meta["title"]:
-                    meta["title"] = parsed_title
-                if not meta["artist"]:
-                    meta["artist"] = parsed_artist
-                if not meta["label"]:
-                    meta["label"] = parsed_label
+                length_ms = track.get("length_ms")
+                if length_ms and isinstance(length_ms, (int, float)):
+                    meta["duration_sec"] = int(round(length_ms / 1000.0))
 
-            og_img = soup.find("meta", property="og:image") or soup.find("meta", attrs={"name": "og:image"})
-            if og_img and og_img.get("content") and not meta["cover_url"]:
+        if not meta["title"]:
+            og_title = soup.find("meta", property="og:title")
+            raw_t = og_title["content"] if og_title and og_title.get("content") else (soup.title.string if soup.title else "")
+            art, tit = clean_beatport_title(raw_t)
+            if art and not meta["artist"]:
+                meta["artist"] = art
+            if tit:
+                meta["title"] = tit
+
+        if not meta["cover_url"]:
+            og_img = soup.find("meta", property="og:image")
+            if og_img and og_img.get("content"):
                 meta["cover_url"] = og_img["content"]
-
     except Exception as e:
-        logger.warning(f"Beatport parse error: {e}")
+        logger.warning(f"Ошибка парсинга Beatport: {e}")
 
     return meta
 
 
-# ==================== КОНВЕРТАЦИЯ И ТЕГИ (MP3 320 / FLAC / WAV) ====================
-def convert_audio_to_format(input_path: str, target_format: str, tmp_dir: str) -> str:
-    ext = target_format.lower()
-    out_path = os.path.join(tmp_dir, f"output.{ext}")
-    if ext == "flac":
-        cmd = [FFMPEG_BIN, "-y", "-i", input_path, "-vn", "-ar", "44100", "-ac", "2", "-c:a", "flac", out_path]
-    elif ext == "wav":
-        cmd = [FFMPEG_BIN, "-y", "-i", input_path, "-vn", "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le", out_path]
-    else:
-        cmd = [FFMPEG_BIN, "-y", "-i", input_path, "-vn", "-ar", "44100", "-ac", "2", "-b:a", "320k", out_path]
+def parse_tidal_url(url: str) -> dict:
+    m = re.search(r"tidal\.com/(?:browse/)?track/(\d+)", url, re.I)
+    if not m:
+        raise ValueError("Не удалось извлечь ID трека из ссылки Tidal.")
+    tid = m.group(1)
+    meta = {
+        "platform": "tidal",
+        "track_id": tid,
+        "artist": "Unknown Artist",
+        "title": f"Tidal Track {tid}",
+        "mix": None,
+        "album": None,
+        "label": None,
+        "catalog": None,
+        "genre": None,
+        "bpm": None,
+        "key": None,
+        "isrc": None,
+        "release_date": None,
+        "cover_url": None,
+        "duration_sec": None,
+        "is_exclusive": False,
+    }
+    try:
+        r = requests.get(
+            f"https://tidal.com/v1/tracks/{tid}",
+            params={"countryCode": "US"},
+            headers={"x-tidal-token": "49YxDN9a2aFV6RTG", **HEADERS},
+            timeout=12,
+        )
+        if r.status_code == 200:
+            d = r.json()
+            meta["title"] = d.get("title") or meta["title"]
+            meta["mix"] = d.get("version") or None
+            artists = [a.get("name") for a in (d.get("artists") or []) if a.get("name")]
+            if artists:
+                meta["artist"] = ", ".join(artists)
+            elif isinstance(d.get("artist"), dict):
+                meta["artist"] = d["artist"].get("name") or meta["artist"]
+            alb = d.get("album") or {}
+            if isinstance(alb, dict):
+                meta["album"] = alb.get("title")
+                cov = alb.get("cover")
+                if cov:
+                    meta["cover_url"] = f"https://resources.tidal.com/images/{cov.replace('-', '/')}/1280x1280.jpg"
+            meta["duration_sec"] = int(d.get("duration") or 0) or None
+            meta["isrc"] = d.get("isrc")
+            meta["bpm"] = str(d["bpm"]) if d.get("bpm") else None
+            meta["key"] = d.get("key")
+            meta["release_date"] = (d.get("streamStartDate") or "")[:10] or None
+    except Exception as e:
+        logger.warning(f"Tidal metadata warning: {e}")
+    return meta
 
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=40, check=True)
-    return out_path if os.path.exists(out_path) else ""
+
+def parse_qobuz_url(url: str) -> dict:
+    m = re.search(r"qobuz\.com/(?:[a-z]{2}-[a-z]{2}/)?track/(?:[^/?#]+/)?(\d+)", url, re.I)
+    if not m:
+        m = re.search(r"/track/(\d+)", url, re.I)
+    if not m:
+        raise ValueError("Не удалось извлечь ID трека из ссылки Qobuz.")
+    tid = m.group(1)
+    meta = {
+        "platform": "qobuz",
+        "track_id": tid,
+        "artist": "Unknown Artist",
+        "title": f"Qobuz Track {tid}",
+        "mix": None,
+        "album": None,
+        "label": None,
+        "catalog": None,
+        "genre": None,
+        "bpm": None,
+        "key": None,
+        "isrc": None,
+        "release_date": None,
+        "cover_url": None,
+        "duration_sec": None,
+        "is_exclusive": False,
+    }
+    try:
+        r = requests.get(
+            "https://www.qobuz.com/api.json/0.2/track/get",
+            params={"track_id": tid},
+            headers={"X-App-Id": "735532640", **HEADERS},
+            timeout=12,
+        )
+        if r.status_code == 200:
+            d = r.json()
+            meta["title"] = d.get("title") or meta["title"]
+            meta["mix"] = d.get("version") or None
+            perf = d.get("performer") or {}
+            if isinstance(perf, dict) and perf.get("name"):
+                meta["artist"] = perf["name"]
+            alb = d.get("album") or {}
+            if isinstance(alb, dict):
+                meta["album"] = alb.get("title")
+                img = alb.get("image") or {}
+                if isinstance(img, dict):
+                    meta["cover_url"] = img.get("large") or img.get("small")
+                lbl = alb.get("label") or {}
+                if isinstance(lbl, dict):
+                    meta["label"] = lbl.get("name")
+                gnr = alb.get("genre") or {}
+                if isinstance(gnr, dict):
+                    meta["genre"] = gnr.get("name")
+                meta["release_date"] = alb.get("release_date_original")
+            meta["duration_sec"] = int(d.get("duration") or 0) or None
+            meta["isrc"] = d.get("isrc")
+    except Exception as e:
+        logger.warning(f"Qobuz metadata warning: {e}")
+    return meta
+
+
+def parse_amazon_url(url: str) -> dict:
+    parsed = urllib.parse.urlparse(url.strip())
+    qs = urllib.parse.parse_qs(parsed.query)
+    asin = (qs.get("trackAsin") or qs.get("trackasin") or [""])[0]
+    if not asin:
+        m = re.search(r"/(?:tracks?|albums?)/([A-Z0-9]{10})", url, re.I)
+        if m:
+            asin = m.group(1)
+    if not asin:
+        raise ValueError("Не удалось извлечь ASIN трека из ссылки Amazon Music.")
+    asin = asin.upper()
+    return {
+        "platform": "amazon",
+        "track_id": asin,
+        "artist": "Amazon Music",
+        "title": f"Track {asin}",
+        "mix": None,
+        "album": None,
+        "label": None,
+        "catalog": None,
+        "genre": None,
+        "bpm": None,
+        "key": None,
+        "isrc": None,
+        "release_date": None,
+        "cover_url": None,
+        "duration_sec": None,
+        "is_exclusive": False,
+    }
+
+
+def parse_deezer_url(url: str) -> dict:
+    real_url = url.strip()
+    if "deezer.page.link" in real_url or "link.deezer.com" in real_url:
+        try:
+            r_redir = requests.get(real_url, headers=HEADERS, allow_redirects=True, timeout=10)
+            real_url = r_redir.url
+        except Exception:
+            pass
+    m = re.search(r"/track/(\d+)", real_url)
+    if not m:
+        raise ValueError("Не удалось извлечь ID трека из ссылки Deezer.")
+    tid = m.group(1)
+    meta = {
+        "platform": "deezer",
+        "track_id": tid,
+        "artist": "Unknown Artist",
+        "title": f"Deezer Track {tid}",
+        "mix": None,
+        "album": None,
+        "label": None,
+        "catalog": None,
+        "genre": None,
+        "bpm": None,
+        "key": None,
+        "isrc": None,
+        "release_date": None,
+        "cover_url": None,
+        "duration_sec": None,
+        "is_exclusive": False,
+    }
+    try:
+        r = requests.get(f"https://api.deezer.com/track/{tid}", headers=HEADERS, timeout=10)
+        if r.status_code == 200:
+            d = r.json()
+            meta["title"] = d.get("title_short") or d.get("title") or meta["title"]
+            meta["mix"] = d.get("title_version", "").strip("()") or None
+            if isinstance(d.get("artist"), dict):
+                meta["artist"] = d["artist"].get("name") or meta["artist"]
+            if isinstance(d.get("album"), dict):
+                meta["album"] = d["album"].get("title")
+                meta["cover_url"] = d["album"].get("cover_xl") or d["album"].get("cover_big")
+            meta["duration_sec"] = int(d.get("duration") or 0) or None
+            meta["isrc"] = d.get("isrc")
+            meta["bpm"] = str(int(d["bpm"])) if d.get("bpm") else None
+            meta["release_date"] = d.get("release_date")
+    except Exception as e:
+        logger.warning(f"Deezer metadata warning: {e}")
+    return meta
+
+
+# ==================== КОНВЕРТАЦИЯ ФОРМАТОВ И ID3 / FLAC ТЕГИ ====================
+def convert_audio_to_format(input_path: str, target_format: str, tmp_dir: str) -> str:
+    target_format = target_format.lower().strip()
+    out_path = os.path.join(tmp_dir, f"converted_{uuid.uuid4().hex[:8]}.{target_format}")
+    if input_path.lower().endswith(f".{target_format}"):
+        return input_path
+
+    if not shutil.which("ffmpeg"):
+        return input_path
+
+    if target_format == "flac":
+        cmd = ["ffmpeg", "-y", "-i", input_path, "-vn", "-c:a", "flac", "-compression_level", "8", out_path]
+    elif target_format == "wav":
+        cmd = ["ffmpeg", "-y", "-i", input_path, "-vn", "-c:a", "pcm_s16le", "-ar", "44100", out_path]
+    else:
+        cmd = ["ffmpeg", "-y", "-i", input_path, "-vn", "-c:a", "libmp3lame", "-b:a", "320k", out_path]
+
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90)
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 50_000:
+        return out_path
+    return input_path
 
 
 def embed_tags(file_path: str, meta: dict, cover_bytes: bytes = None):
-    full_title = meta.get("title", "Track")
-    if meta.get("mix") and meta["mix"].lower() not in full_title.lower() and meta["mix"] != "Original Mix":
+    ext = os.path.splitext(file_path)[1].lower()
+    full_title = meta.get("title") or "Unknown Track"
+    if meta.get("mix") and meta["mix"].lower() not in full_title.lower():
         full_title = f"{full_title} ({meta['mix']})"
-    lbl_text = meta.get("label") or ""
-    if lbl_text and meta.get("catalog"):
-        lbl_text = f"{lbl_text} [{meta['catalog']}]"
+    artist = meta.get("artist") or "Unknown Artist"
+    album = meta.get("album") or full_title
 
-    if file_path.lower().endswith(".flac"):
-        try:
-            audio = FLAC(file_path)
-            audio["title"] = full_title
-            if meta.get("artist"):
-                audio["artist"] = meta["artist"]
-            if lbl_text:
-                audio["album"] = lbl_text
-            if meta.get("bpm"):
-                audio["bpm"] = str(meta["bpm"])
-            if meta.get("key"):
-                audio["initialkey"] = str(meta["key"])
-            if meta.get("genre"):
-                audio["genre"] = str(meta["genre"])
-            if cover_bytes:
-                pic = Picture()
-                pic.type = 3
-                pic.mime = "image/jpeg"
-                pic.desc = "Cover"
-                pic.data = cover_bytes
-                audio.clear_pictures()
-                audio.add_picture(pic)
-            audio.save()
-        except Exception as e:
-            logger.warning(f"FLAC tagging warning: {e}")
-        return
-
-    if file_path.lower().endswith(".mp3"):
+    if ext == ".mp3":
         try:
             try:
                 tags = ID3(file_path)
             except ID3NoHeaderError:
                 tags = ID3()
-            tags["TIT2"] = TIT2(encoding=3, text=full_title)
-            if meta.get("artist"):
-                tags["TPE1"] = TPE1(encoding=3, text=meta["artist"])
-            if lbl_text:
-                tags["TALB"] = TALB(encoding=3, text=lbl_text)
-            if meta.get("bpm"):
-                tags["TBPM"] = TBPM(encoding=3, text=str(meta["bpm"]))
-            if meta.get("key"):
-                tags["TKEY"] = TKEY(encoding=3, text=str(meta["key"]))
+            tags.add(TIT2(encoding=3, text=full_title))
+            tags.add(TPE1(encoding=3, text=artist))
+            tags.add(TALB(encoding=3, text=album))
             if meta.get("genre"):
-                tags["TCON"] = TCON(encoding=3, text=str(meta["genre"]))
+                tags.add(TCON(encoding=3, text=str(meta["genre"])))
+            if meta.get("release_date"):
+                tags.add(TDRC(encoding=3, text=str(meta["release_date"])[:10]))
+            if meta.get("label"):
+                tags.add(TPUB(encoding=3, text=str(meta["label"])))
+            if meta.get("bpm"):
+                tags.add(TBPM(encoding=3, text=str(meta["bpm"])))
+            if meta.get("key"):
+                tags.add(TKEY(encoding=3, text=str(meta["key"])))
+            if meta.get("isrc"):
+                tags.add(TSRC(encoding=3, text=str(meta["isrc"])))
+            if meta.get("catalog"):
+                tags.add(TXXX(encoding=3, desc="CATALOGNUMBER", text=str(meta["catalog"])))
+            tags.add(COMM(encoding=3, lang="eng", desc="", text="Downloaded via @sweet_music_dl_bot (MusicVibez.org)"))
             if cover_bytes:
-                tags["APIC"] = APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=cover_bytes)
-            tags.save(file_path)
+                tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=cover_bytes))
+            tags.save(file_path, v2_version=3)
         except Exception as e:
-            logger.warning(f"MP3 tagging warning: {e}")
+            logger.warning(f"MP3 tag error: {e}")
 
-
-# ==================== ПОИСК ТОЛЬКО EXTENDED MIX ====================
-def normalize_for_match(s: str) -> str:
-    s = re.sub(r"\([^\)]*\)|\[[^\]]*\]", "", (s or "").lower())
-    s = re.sub(r"[^a-z0-9а-яё\s]", " ", s)
-    return " ".join(s.split())
-
-
-def audiomack_api_get(path: str, params: dict = None) -> dict:
-    params = dict(params or {})
-    url = "https://api.audiomack.com/v1" + path
-    oauth = {
-        "oauth_consumer_key": AM_CONSUMER_KEY,
-        "oauth_nonce": uuid.uuid4().hex,
-        "oauth_signature_method": "HMAC-SHA1",
-        "oauth_timestamp": str(int(time.time())),
-        "oauth_version": "1.0",
-    }
-    all_p = {**params, **oauth}
-    sorted_p = "&".join(
-        f"{urllib.parse.quote(str(k), safe='')}={urllib.parse.quote(str(v), safe='')}"
-        for k, v in sorted(all_p.items())
-    )
-    base_str = f"GET&{urllib.parse.quote(url, safe='')}&{urllib.parse.quote(sorted_p, safe='')}"
-    sig = base64.b64encode(
-        hmac.new((AM_CONSUMER_SECRET + "&").encode(), base_str.encode(), hashlib.sha1).digest()
-    ).decode()
-    all_p["oauth_signature"] = sig
-    full_url = f"{url}?{urllib.parse.urlencode(all_p)}"
-    r = requests.get(full_url, headers=HEADERS, timeout=10)
-    r.raise_for_status()
-    return r.json()
-
-
-def download_extended_from_audiomack(meta: dict, target_format: str, tmp_dir: str, allow_radio_fallback: bool = False):
-    artist = meta.get("artist", "").strip()
-    title = meta.get("title", "").strip()
-    mix = meta.get("mix", "").strip()
-    expected_dur = int(meta.get("duration_sec") or 0)
-
-    base_title = normalize_for_match(title)
-    first_artist = normalize_for_match(artist.split(",")[0])
-
-    queries = [f"{artist} {title} {mix}".strip(), f"{artist} {title}".strip()]
-    best_radio_candidate = None
-
-    for q in queries:
+    elif ext == ".flac":
         try:
-            search_res = audiomack_api_get("/search", {"q": q, "show": "songs", "limit": 8})
-            for item in search_res.get("results") or []:
-                item_title = normalize_for_match(str(item.get("title") or ""))
-                item_artist = normalize_for_match(
-                    str(item.get("artist") or (item.get("uploader") or {}).get("name") or "")
-                )
-                dur = int(item.get("duration") or 0)
-
-                if base_title and base_title not in item_title and item_title not in base_title:
-                    continue
-                if first_artist and first_artist not in item_artist and first_artist not in item_title:
-                    continue
-                if dur < 60 or dur > 900:
-                    continue
-
-                is_extended_length = (expected_dur == 0) or (abs(dur - expected_dur) <= 20) or (dur >= expected_dur - 15)
-
-                if not is_extended_length and not allow_radio_fallback:
-                    if not best_radio_candidate:
-                        best_radio_candidate = dur
-                    continue
-
-                song_id = item.get("id")
-                play_data = audiomack_api_get(
-                    f"/music/play/{song_id}",
-                    {"environment": "desktop-web", "hq": "true", "section": "search"},
-                )
-                stream_url = play_data.get("signedUrl") or play_data.get("url")
-                if not stream_url:
-                    continue
-
-                raw_audio_path = os.path.join(tmp_dir, "am_raw.m4a")
-                with requests.get(stream_url, headers=HEADERS, stream=True, timeout=20) as sr:
-                    sr.raise_for_status()
-                    with open(raw_audio_path, "wb") as f:
-                        for chunk in sr.iter_content(chunk_size=65536):
-                            if chunk:
-                                f.write(chunk)
-
-                converted = convert_audio_to_format(raw_audio_path, target_format, tmp_dir)
-                if converted:
-                    return converted, dur
+            audio = FLAC(file_path)
+            audio["TITLE"] = full_title
+            audio["ARTIST"] = artist
+            audio["ALBUM"] = album
+            if meta.get("genre"):
+                audio["GENRE"] = str(meta["genre"])
+            if meta.get("release_date"):
+                audio["DATE"] = str(meta["release_date"])[:10]
+            if meta.get("label"):
+                audio["ORGANIZATION"] = str(meta["label"])
+                audio["LABEL"] = str(meta["label"])
+            if meta.get("bpm"):
+                audio["BPM"] = str(meta["bpm"])
+            if meta.get("key"):
+                audio["INITIALKEY"] = str(meta["key"])
+            if meta.get("isrc"):
+                audio["ISRC"] = str(meta["isrc"])
+            if meta.get("catalog"):
+                audio["CATALOGNUMBER"] = str(meta["catalog"])
+            audio["COMMENT"] = "Downloaded via @sweet_music_dl_bot (MusicVibez.org)"
+            if cover_bytes:
+                pic = Picture()
+                pic.type = 3
+                pic.mime = "image/jpeg"
+                pic.desc = "Front Cover"
+                pic.data = cover_bytes
+                audio.clear_pictures()
+                audio.add_picture(pic)
+            audio.save()
         except Exception as e:
-            logger.warning(f"Audiomack error: {e}")
-
-    return "", best_radio_candidate
+            logger.warning(f"FLAC tag error: {e}")
 
 
+# ==================== ПОИСК FULL EXTENDED В TIDAL / QOBUZ / DEEZER / AUDIOMACK ====================
+def normalize_for_match(s: str) -> str:
+    if not s:
+        return ""
+    s = re.sub(r"[^\w\s]", " ", s.lower())
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def find_matching_tidal_track(meta: dict, expected_dur: int = 0) -> str:
+    artist = meta.get("artist") or ""
+    title = meta.get("title") or ""
+    isrc = (meta.get("isrc") or "").strip().upper()
+    q = f"{artist} {title}".strip()
+    if not q:
+        return ""
+    try:
+        r = requests.get(
+            "https://tidal.com/v1/search/tracks",
+            params={"query": q, "limit": 15, "countryCode": "US"},
+            headers={"x-tidal-token": "49YxDN9a2aFV6RTG", **HEADERS},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return ""
+        items = r.json().get("items") or []
+        req_art = normalize_for_match(artist.split(",")[0])
+        req_tit = normalize_for_match(title)
+        for it in items:
+            it_isrc = str(it.get("isrc") or "").strip().upper()
+            it_dur = int(it.get("duration") or 0)
+            if isrc and it_isrc == isrc:
+                if not expected_dur or abs(it_dur - expected_dur) <= 20:
+                    return str(it["id"])
+            it_art = normalize_for_match(" ".join(a.get("name", "") for a in (it.get("artists") or [])))
+            it_tit = normalize_for_match(f"{it.get('title', '')} {it.get('version') or ''}")
+            if req_art in it_art and req_tit in it_tit:
+                if not expected_dur or abs(it_dur - expected_dur) <= 20:
+                    return str(it["id"])
+    except Exception:
+        pass
+    return ""
+
+
+def find_matching_qobuz_track(meta: dict, expected_dur: int = 0) -> str:
+    artist = meta.get("artist") or ""
+    title = meta.get("title") or ""
+    isrc = (meta.get("isrc") or "").strip().upper()
+    q = f"{artist} {title}".strip()
+    if not q:
+        return ""
+    try:
+        r = requests.get(
+            "https://www.qobuz.com/api.json/0.2/track/search",
+            params={"query": q, "limit": 15},
+            headers={"X-App-Id": "735532640", **HEADERS},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return ""
+        items = r.json().get("tracks", {}).get("items") or []
+        req_art = normalize_for_match(artist.split(",")[0])
+        req_tit = normalize_for_match(title)
+        for it in items:
+            it_isrc = str(it.get("isrc") or "").strip().upper()
+            it_dur = int(it.get("duration") or 0)
+            if isrc and it_isrc == isrc:
+                if not expected_dur or abs(it_dur - expected_dur) <= 20:
+                    return str(it["id"])
+            perf = (it.get("performer") or {}).get("name") or ""
+            it_art = normalize_for_match(perf)
+            it_tit = normalize_for_match(f"{it.get('title', '')} {it.get('version') or ''}")
+            if req_art in it_art and req_tit in it_tit:
+                if not expected_dur or abs(it_dur - expected_dur) <= 20:
+                    return str(it["id"])
+    except Exception:
+        pass
+    return ""
+
+
+# ==================== ГЛАВНЫЙ ПАЙПЛАЙН СКАЧИВАНИЯ ====================
 def process_download_request(url: str, meta: dict, target_format: str, tmp_dir: str, allow_radio_fallback: bool = False):
+    """
+    Скачивает трек в выбранном формате (flac | wav | mp3):
+    1) Если ссылка на Beatport:
+       - Сначала качает оригинальный FLAC Lossless (Extended Mix) напрямую с серверов Beatport через ZarzV2 (btp)!
+       - Либо через личный аккаунт Beatport API v4 (если настроен).
+       - Либо ищет точный Extended Mix по ISRC и длительности в Tidal Hi-Res / Qobuz Hi-Res.
+    2) Если ссылка на Tidal -> качает Hi-Res / CD FLAC через ZarzV2 (tid).
+    3) Если ссылка на Qobuz -> качает Hi-Res / CD FLAC через ZarzV2 (qbz).
+    4) Если ссылка на Amazon Music -> качает Ultra HD FLAC через ZarzV2 (amazeamazeamaze) + расшифровка ffmpeg.
+    5) Если ссылка на Deezer -> качает FLAC через ZarzV2 (dzr).
+    6) Если прямая ссылка на SoundCloud / Bandcamp -> качает напрямую через yt-dlp.
+    """
+    platform = (meta.get("platform") or "beatport").lower()
+    audio_path = None
+    actual_dur = meta.get("duration_sec") or 0
+
+    # 1. Прямая ссылка на SoundCloud или Bandcamp (ТОЛЬКО если пользователь сам её скинул!)
+    if platform in ("soundcloud", "bandcamp") or any(d in url.lower() for d in ("soundcloud.com", "bandcamp.com")):
+        out_tmpl = os.path.join(tmp_dir, "direct_%(id)s.%(ext)s")
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "outtmpl": out_tmpl,
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "socket_timeout": 20,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if "entries" in info:
+                info = info["entries"][0]
+            dl_file = ydl.prepare_filename(info)
+            if not meta.get("title"):
+                meta["title"] = info.get("track") or info.get("title") or "Track"
+            if not meta.get("artist"):
+                meta["artist"] = info.get("artist") or info.get("uploader") or "Artist"
+            if not meta.get("cover_url"):
+                meta["cover_url"] = info.get("thumbnail")
+            actual_dur = int(info.get("duration") or 0)
+            audio_path = convert_audio_to_format(dl_file, target_format, tmp_dir)
+
+    # 2. Прямая ссылка на TIDAL
+    elif platform == "tidal":
+        audio_path = ZARZ_CLIENT.download_tidal_track(meta["track_id"], target_format, tmp_dir)
+
+    # 3. Прямая ссылка на QOBUZ
+    elif platform == "qobuz":
+        audio_path = ZARZ_CLIENT.download_qobuz_track(meta["track_id"], target_format, tmp_dir)
+
+    # 4. Прямая ссылка на AMAZON MUSIC
+    elif platform == "amazon":
+        audio_path, amz_extra = ZARZ_CLIENT.download_amazon_track(meta["track_id"], target_format, tmp_dir)
+        for k, v in amz_extra.items():
+            if v and (not meta.get(k) or meta.get(k) in ("Amazon Music", f"Track {meta['track_id']}")):
+                meta[k] = v
+
+    # 5. Прямая ссылка на DEEZER
+    elif platform == "deezer":
+        audio_path = ZARZ_CLIENT.download_deezer_track(meta["track_id"], target_format, tmp_dir)
+
+    # 6. Ссылка на BEATPORT (оригинальный Extended Mix в FLAC / WAV / MP3 320!)
+    else:
+        bp_err = None
+        if meta.get("track_id"):
+            # Шаг А: Пробуем скачать оригинальный FLAC напрямую с Beatport через бесплатный шлюз ZarzV2 (btp)
+            try:
+                audio_path = ZARZ_CLIENT.download_beatport_track(meta["track_id"], target_format, tmp_dir)
+            except ZarzVerificationRequired:
+                raise
+            except Exception as e:
+                bp_err = e
+                logger.warning(f"Zarz Beatport direct warning: {e}")
+
+            # Шаг Б: Если настроен личный токен Beatport API v4
+            if not audio_path:
+                try:
+                    audio_path = download_direct_from_beatport_api(meta["track_id"], target_format, tmp_dir)
+                except Exception as e:
+                    logger.warning(f"Personal Beatport API v4 warning: {e}")
+
+            # Шаг В: Ищем точный Extended Mix по ISRC и длительности в Tidal / Qobuz через ZarzV2
+            if not audio_path:
+                expected_dur = 0 if allow_radio_fallback else int(meta.get("duration_sec") or 0)
+                tid_match = find_matching_tidal_track(meta, expected_dur=expected_dur)
+                if tid_match:
+                    try:
+                        audio_path = ZARZ_CLIENT.download_tidal_track(tid_match, target_format, tmp_dir)
+                    except ZarzVerificationRequired:
+                        raise
+                    except Exception as e:
+                        logger.warning(f"Tidal fallback warning: {e}")
+
+                if not audio_path:
+                    qbz_match = find_matching_qobuz_track(meta, expected_dur=expected_dur)
+                    if qbz_match:
+                        try:
+                            audio_path = ZARZ_CLIENT.download_qobuz_track(qbz_match, target_format, tmp_dir)
+                        except ZarzVerificationRequired:
+                            raise
+                        except Exception as e:
+                            logger.warning(f"Qobuz fallback warning: {e}")
+
+        if not audio_path:
+            err_detail = f" ({bp_err})" if bp_err else ""
+            raise ValueError(
+                f"Не удалось скачать оригинальный Extended Mix <b>{meta.get('artist')} – {meta.get('title')}</b>{err_detail}."
+            )
+
+    # Скачиваем обложку и вшиваем все DJ-теги
     cover_bytes = None
     cover_path = None
     if meta.get("cover_url"):
         try:
-            cr = requests.get(meta["cover_url"], headers=HEADERS, timeout=8)
-            if cr.ok and len(cr.content) > 1000:
+            cr = requests.get(meta["cover_url"], headers=HEADERS, timeout=12)
+            if cr.status_code == 200 and len(cr.content) > 1000:
                 cover_bytes = cr.content
                 cover_path = os.path.join(tmp_dir, "cover.jpg")
-                with open(cover_path, "wb") as cf:
-                    cf.write(cover_bytes)
+                with open(cover_path, "wb") as f:
+                    f.write(cover_bytes)
         except Exception:
             pass
 
-    if any(d in url.lower() for d in ("soundcloud.com", "on.soundcloud.com", "bandcamp.com")):
-        raw_tmpl = os.path.join(tmp_dir, "direct_raw.%(ext)s")
-        ydl_opts = {"format": "bestaudio/best", "outtmpl": raw_tmpl, "noplaylist": True, "quiet": True}
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            dl_file = ydl.prepare_filename(info)
-            if not meta.get("title"):
-                meta["title"] = info.get("title") or "Track"
-            if not meta.get("artist"):
-                meta["artist"] = info.get("uploader") or "Artist"
-            out_file = convert_audio_to_format(dl_file, target_format, tmp_dir)
-            embed_tags(out_file, meta, cover_bytes)
-            return out_file, cover_path, int(info.get("duration") or 0)
-
-    if meta.get("track_id"):
-        bp_direct = download_direct_from_beatport_api(meta["track_id"], target_format, tmp_dir)
-        if bp_direct and os.path.exists(bp_direct):
-            embed_tags(bp_direct, meta, cover_bytes)
-            return bp_direct, cover_path, int(meta.get("duration_sec") or 0)
-
-    out_file, found_dur = download_extended_from_audiomack(
-        meta, target_format, tmp_dir, allow_radio_fallback=allow_radio_fallback
-    )
-    if out_file and os.path.exists(out_file):
-        embed_tags(out_file, meta, cover_bytes)
-        return out_file, cover_path, found_dur
-
-    bp_dur_str = format_mm_ss(meta.get("duration_sec") or 0)
-    has_bp_creds = bool(_BP_AUTH_STATE["username"] or _BP_AUTH_STATE["access_token"])
-
-    if found_dur and not allow_radio_fallback:
-        radio_dur_str = format_mm_ss(found_dur)
-        raise ValueError(
-            f"EXTENDED_ONLY_ON_BEATPORT|{bp_dur_str}|{radio_dur_str}|{has_bp_creds}"
-        )
-
-    raise RuntimeError(
-        f"Полная версия Extended Mix ({bp_dur_str}) закрыта эксклюзивом Beatport и не выложена лейблом в бесплатный доступ.\n\n"
-        f"💡 Для прямого скачивания с серверов Beatport подключите аккаунт:\n<code>/bp_login email пароль</code>\nили\n<code>/bp_token токен</code>"
-    )
+    embed_tags(audio_path, meta, cover_bytes)
+    return audio_path, cover_path, actual_dur
 
 
-# ==================== КОМАНДЫ И ОБРАБОТЧИКИ TELEGRAM ====================
+# ==================== TELEGRAM HANDLERS ====================
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    bp_status = "✅ Подключен (прямое скачивание Extended Mix с Beatport API v4)" if (
-        _BP_AUTH_STATE["username"] or _BP_AUTH_STATE["access_token"]
-    ) else "⚠️ Не подключен (включен фильтр против Radio Edit)"
-
+    zarz_ok = ZARZ_CLIENT.is_valid()
+    status_line = (
+        "🟢 <b>Lossless-сервер (Beatport / Tidal / Qobuz / Amazon / Deezer):</b> Активен (FLAC / WAV / MP3 320)"
+        if zarz_ok
+        else "🟡 <b>Lossless-сервер:</b> Нажмите /activate для бесплатной активации в 1 клик (без подписок!)"
+    )
     await message.answer(
-        "🎧 <b>Musicvibez.org Beatport Downloader (PRO Edition)</b>\n\n"
-        "Отправьте ссылку на трек:\n"
-        "• <b>Beatport</b> — выбор формата: <b>MP3 320 kbps</b>, <b>FLAC</b> или <b>WAV</b> (строгий контроль <b>Extended Mix</b> по длительности, без YouTube и без урезанных Radio Edit!)\n"
-        "• <b>SoundCloud / Bandcamp</b> — скачивание только по вашей прямой ссылке.\n\n"
-        f"🔌 <b>Прямой доступ Beatport API v4:</b> {bp_status}\n"
-        "Для привязки аккаунта Beatport Streaming используйте:\n"
-        "<code>/bp_login email пароль</code> или <code>/bp_token токен</code>",
+        "👋 <b>Привет! Я мультиплатформенный Lossless-загрузчик для DJ:</b>\n"
+        "• <b>Beatport</b> (полные <b>Extended Mix</b> в <b>FLAC Lossless / WAV / MP3 320</b>)\n"
+        "• <b>Tidal</b> (Hi-Res 24-bit / 16-bit FLAC)\n"
+        "• <b>Qobuz</b> (Hi-Res 24-bit / CD FLAC)\n"
+        "• <b>Amazon Music</b> (Ultra HD / HD FLAC)\n"
+        "• <b>Deezer</b> (FLAC Lossless)\n"
+        "• <b>SoundCloud</b> (только по прямой ссылке)\n\n"
+        f"{status_line}\n\n"
+        "💎 <b>Никаких платных подписок покупать не нужно!</b> Просто отправьте ссылку на трек с Beatport, Tidal, Qobuz, Amazon Music или Deezer.",
         parse_mode="HTML",
     )
 
 
+@dp.message(Command("activate", "zarz", "bp_status"))
+async def cmd_activate(message: types.Message):
+    if ZARZ_CLIENT.is_valid():
+        await message.answer(
+            f"🟢 <b>Lossless-шлюз (Beatport / Tidal / Qobuz / Amazon / Deezer) уже активен!</b>\n"
+            f"Сессия действует до: <code>{ZARZ_CLIENT.expires_at}</code> (продлевается автоматически).\n\n"
+            f"Можете сразу отправлять ссылки на Beatport, Tidal, Qobuz, Amazon Music или Deezer!",
+            parse_mode="HTML",
+        )
+        return
+    try:
+        auth_url = await asyncio.to_thread(ZARZ_CLIENT.bootstrap_challenge_url)
+        if not auth_url:
+            await message.answer("🟢 <b>Lossless-шлюз успешно активирован автоматически!</b>", parse_mode="HTML")
+            return
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔐 Открыть страницу активации (1 клик)", url=auth_url)]
+            ]
+        )
+        await message.answer(
+            "🔓 <b>Бесплатная активация Lossless-сервера (Beatport / Tidal / Qobuz / Amazon FLAC):</b>\n\n"
+            "1️⃣ Нажмите кнопку ниже и поставьте галочку Cloudflare.\n"
+            "2️⃣ Нажмите зелёную кнопку <b>«Copy link»</b> на странице.\n"
+            "3️⃣ Просто <b>вставьте скопированную ссылку</b> (начинается на <code>spotiflac://...</code>) в этот чат!\n\n"
+            "<i>После этого бот будет бесплатно качать оригинальные FLAC / WAV / MP3 320 с Beatport, Tidal, Qobuz и Amazon Music и сам автоматически продлевать сессию!</i>",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        await message.answer(f"❌ Ошибка получения ссылки активации: {e}")
+
+
 @dp.message(Command("bp_login"))
 async def cmd_bp_login(message: types.Message):
-    parts = (message.text or "").strip().split(maxsplit=2)
+    parts = message.text.strip().split(maxsplit=2)
     if len(parts) < 3:
         await message.answer("Использование: <code>/bp_login ваш_email ваш_пароль</code>", parse_mode="HTML")
         return
-    _BP_AUTH_STATE["username"] = parts[1].strip()
-    _BP_AUTH_STATE["password"] = parts[2].strip()
-    _BP_AUTH_STATE["access_token"] = ""
-    _BP_AUTH_STATE["refresh_token"] = ""
-    status = await message.answer("🔐 Проверяю авторизацию на сервере api.beatport.com/v4...")
-    token = await asyncio.to_thread(bp_login_and_get_token)
-    if token:
-        await status.edit_text("✅ <b>Аккаунт Beatport успешно подключен!</b>\nТеперь все треки качаются напрямую с серверов Beatport в FLAC / WAV / 320 kbps.", parse_mode="HTML")
-    else:
-        await status.edit_text("❌ Не удалось войти в Beatport. Проверьте логин/пароль или наличие подписки Beatport Streaming.")
+    _, email, password = parts
+    with open(BP_CREDS_FILE, "w", encoding="utf-8") as f:
+        json.dump({"username": email, "password": password}, f)
+    _BP_TOKEN_CACHE["access_token"] = ""
+    try:
+        tok = await asyncio.to_thread(bp_login_and_get_token)
+        if tok:
+            await message.answer("✅ <b>Аккаунт Beatport успешно привязан!</b>", parse_mode="HTML")
+    except Exception as e:
+        await message.answer(f"❌ <b>Не удалось войти в Beatport:</b>\n<code>{e}</code>", parse_mode="HTML")
 
 
-@dp.message(Command("bp_token"))
-async def cmd_bp_token(message: types.Message):
-    parts = (message.text or "").strip().split(maxsplit=1)
-    if len(parts) < 2:
-        await message.answer("Использование: <code>/bp_token ваш_bearer_токен_beatport</code>", parse_mode="HTML")
+async def execute_download_and_send(chat_id: int, status_msg: types.Message, req_id: str, fmt: str, allow_radio: bool = False):
+    task_data = _PENDING_TRACKS.get(req_id)
+    if not task_data:
+        await status_msg.edit_text("⚠️ Сессия трека устарела, отправьте ссылку заново.")
         return
-    _BP_AUTH_STATE["access_token"] = parts[1].strip()
-    _BP_AUTH_STATE["expires_at"] = 0
-    await message.answer("✅ <b>Bearer-токен Beatport сохранен!</b> Теперь бот запрашивает прямые потоки с api.beatport.com/v4.", parse_mode="HTML")
+
+    url = task_data["url"]
+    meta = task_data["meta"]
+    clean_artist = meta.get("artist") or "Artist"
+    clean_title = meta.get("title") or "Track"
+    if meta.get("mix") and meta["mix"].lower() not in clean_title.lower():
+        clean_title = f"{clean_title} ({meta['mix']})"
+
+    platform_names = {
+        "beatport": "Beatport Lossless",
+        "tidal": "Tidal Hi-Res / FLAC",
+        "qobuz": "Qobuz Hi-Res / FLAC",
+        "amazon": "Amazon Music Ultra HD",
+        "deezer": "Deezer FLAC",
+        "soundcloud": "SoundCloud",
+    }
+    plat_label = platform_names.get(meta.get("platform", "beatport"), "Lossless")
+
+    await status_msg.edit_text(
+        f"⏳ <b>{clean_artist} – {clean_title}</b>\n"
+        f"Источник: <b>{plat_label}</b> | Формат: <b>{fmt.upper()}</b>\n"
+        f"Скачиваем оригинал и вшиваем теги...",
+        parse_mode="HTML",
+    )
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            file_path, cover_path, actual_dur = await asyncio.wait_for(
+                asyncio.to_thread(process_download_request, url, meta, fmt, tmp_dir, allow_radio),
+                timeout=95.0,
+            )
+            # Перечитываем обновлённые метаданные (например, с Amazon Music)
+            clean_artist = meta.get("artist") or clean_artist
+            clean_title = meta.get("title") or clean_title
+            if meta.get("mix") and meta["mix"].lower() not in clean_title.lower():
+                clean_title = f"{clean_title} ({meta['mix']})"
+
+            caption_parts = [f"🎵 <b>{clean_artist} – {clean_title}</b>"]
+            caption_parts.append(f"💎 <b>Source:</b> {plat_label} ({fmt.upper()})")
+            if meta.get("label"):
+                lbl_str = f"{meta['label']} [{meta['catalog']}]" if meta.get("catalog") else meta["label"]
+                caption_parts.append(f"🏷 <b>Label:</b> {lbl_str}")
+            if meta.get("genre"):
+                caption_parts.append(f"💿 <b>Genre:</b> {meta['genre']}")
+            if meta.get("bpm"):
+                caption_parts.append(f"⚡ <b>BPM:</b> {meta['bpm']}")
+            if meta.get("key"):
+                caption_parts.append(f"🎹 <b>Key:</b> {meta['key']}")
+            if actual_dur:
+                caption_parts.append(f"⏱ <b>Length:</b> {format_mm_ss(actual_dur)}")
+            caption_parts.append(
+                "\n🎧 <a href='https://musicvibez.org'>MusicVibez.org</a> • <a href='https://specialfordjs.org'>SpecialForDJs.org</a>"
+            )
+
+            ext = fmt.lower()
+            clean_filename = f"{clean_artist} - {clean_title}.{ext}".replace("/", "_").replace("\\", "_").replace(":", "")
+            audio_file = FSInputFile(file_path, filename=clean_filename)
+            thumb_file = FSInputFile(cover_path) if cover_path and os.path.exists(cover_path) else None
+
+            await status_msg.edit_text(f"🚀 Выгружаю <b>{fmt.upper()}</b> в Telegram...", parse_mode="HTML")
+            await bot.send_audio(
+                chat_id=chat_id,
+                audio=audio_file,
+                title=clean_title,
+                performer=clean_artist,
+                duration=actual_dur if actual_dur and actual_dur > 0 else None,
+                thumbnail=thumb_file,
+                caption="\n".join(caption_parts),
+                parse_mode="HTML",
+            )
+            await status_msg.delete()
+    except ZarzVerificationRequired as zv:
+        _WAITING_FOR_GRANT[chat_id] = {"req_id": req_id, "fmt": fmt, "allow_radio": allow_radio}
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔐 Активировать сервер в 1 клик (бесплатно)", url=zv.auth_url)]
+            ]
+        )
+        await status_msg.edit_text(
+            f"🔓 <b>Требуется разовая активация бесплатного Lossless-сервера!</b>\n\n"
+            f"Чтобы скачать <b>{clean_artist} – {clean_title}</b> в <b>{fmt.upper()}</b> напрямую без платных подписок:\n"
+            f"1️⃣ Нажмите кнопку ниже и пройдите проверку Cloudflare (1 сек).\n"
+            f"2️⃣ Нажмите зелёную кнопку <b>«Copy link»</b>.\n"
+            f"3️⃣ Отправьте скопированную ссылку (<code>spotiflac://...</code>) прямо сюда в чат — и я <b>сразу же пришлю этот трек!</b>",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.exception("Download execution error")
+        await status_msg.edit_text(f"❌ {str(e)[:400]}", parse_mode="HTML")
 
 
 @dp.message(F.text)
 async def handle_link(message: types.Message):
-    text = (message.text or "").strip()
-    if text.startswith("/"):
+    text = message.text.strip()
+
+    # 1. Проверяем, не прислал ли пользователь ссылку активации spotiflac:// или grant=...
+    if "spotiflac://" in text or "mornye://" in text or "grant=" in text or text.startswith("grt_"):
+        status_msg = await message.answer("⏳ Проверяю код активации Lossless-сервера...")
+        try:
+            await asyncio.to_thread(ZARZ_CLIENT.exchange_grant, text)
+            waiting = _WAITING_FOR_GRANT.pop(message.chat.id, None)
+            if waiting and waiting["req_id"] in _PENDING_TRACKS:
+                await status_msg.edit_text(
+                    "✅ <b>Lossless-сервер успешно активирован!</b>\nНачинаю скачивание вашего трека...",
+                    parse_mode="HTML",
+                )
+                await execute_download_and_send(
+                    message.chat.id,
+                    status_msg,
+                    waiting["req_id"],
+                    waiting["fmt"],
+                    waiting["allow_radio"],
+                )
+            else:
+                await status_msg.edit_text(
+                    "✅ <b>Lossless-сервер (Beatport / Tidal / Qobuz / Amazon / Deezer) успешно активирован!</b>\n"
+                    f"Сессия активна до: <code>{ZARZ_CLIENT.expires_at}</code> и будет продлеваться автоматически.\n\n"
+                    "Отправьте ссылку на трек!",
+                    parse_mode="HTML",
+                )
+        except Exception as e:
+            await status_msg.edit_text(f"❌ Не удалось активировать сессию: {e}\nПопробуйте нажать /activate заново.")
         return
 
     url_match = re.search(r"(https?://\S+)", text)
     if not url_match:
-        await message.answer("Отправьте ссылку на трек с Beatport или прямую ссылку на SoundCloud.")
+        await message.answer(
+            "Отправьте ссылку на трек с <b>Beatport</b>, <b>Tidal</b>, <b>Qobuz</b>, <b>Amazon Music</b>, <b>Deezer</b> или <b>SoundCloud</b>.",
+            parse_mode="HTML",
+        )
         return
 
-    url = url_match.group(1)
+    url = url_match.group(1).strip()
+    low_url = url.lower()
 
-    if "soundcloud.com" in url.lower():
+    # Прямая ссылка на SoundCloud / Bandcamp
+    if any(d in low_url for d in ("soundcloud.com", "bandcamp.com")):
         req_id = uuid.uuid4().hex[:10]
-        _PENDING_TRACKS[req_id] = {
-            "url": url,
-            "meta": {"title": "", "artist": "", "mix": "", "duration_sec": 0},
-        }
+        _PENDING_TRACKS[req_id] = {"url": url, "meta": {"platform": "soundcloud", "title": None, "artist": None}}
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
-                    InlineKeyboardButton(text="🎧 MP3 320k", callback_data=f"dl|{req_id}|mp3|0"),
-                    InlineKeyboardButton(text="💎 FLAC", callback_data=f"dl|{req_id}|flac|0"),
+                    InlineKeyboardButton(text="💎 FLAC (Lossless)", callback_data=f"dl|{req_id}|flac|0"),
                     InlineKeyboardButton(text="💿 WAV", callback_data=f"dl|{req_id}|wav|0"),
+                    InlineKeyboardButton(text="🎧 MP3 (320 kbps)", callback_data=f"dl|{req_id}|mp3|0"),
                 ]
             ]
         )
-        await message.answer("☁️ <b>Прямая ссылка SoundCloud</b>\nВыберите формат для скачивания:", reply_markup=kb, parse_mode="HTML")
+        await message.answer(
+            "☁️ <b>Прямая ссылка SoundCloud / Bandcamp</b>\nВыберите формат для скачивания:",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
         return
 
-    if "beatport.com" not in url.lower():
-        await message.answer("⚠️ Поддерживаются ссылки на <b>Beatport</b> (и прямые ссылки на <b>SoundCloud</b>).", parse_mode="HTML")
+    # Определяем платформу (Beatport / Tidal / Qobuz / Amazon Music / Deezer)
+    status_msg = await message.answer("🔍 Читаю метаданные трека...")
+    try:
+        if "beatport.com" in low_url:
+            meta = await asyncio.wait_for(asyncio.to_thread(parse_beatport, url), timeout=15.0)
+            plat_badge = "🎧 <b>Beatport Direct Lossless</b>"
+        elif "tidal.com" in low_url:
+            meta = await asyncio.wait_for(asyncio.to_thread(parse_tidal_url, url), timeout=15.0)
+            plat_badge = "🌊 <b>Tidal Hi-Res / Lossless</b>"
+        elif "qobuz.com" in low_url:
+            meta = await asyncio.wait_for(asyncio.to_thread(parse_qobuz_url, url), timeout=15.0)
+            plat_badge = "💿 <b>Qobuz Hi-Res / Lossless</b>"
+        elif "amazon." in low_url:
+            meta = await asyncio.wait_for(asyncio.to_thread(parse_amazon_url, url), timeout=15.0)
+            plat_badge = "📦 <b>Amazon Music Ultra HD / FLAC</b>"
+        elif "deezer." in low_url:
+            meta = await asyncio.wait_for(asyncio.to_thread(parse_deezer_url, url), timeout=15.0)
+            plat_badge = "💜 <b>Deezer Lossless FLAC</b>"
+        else:
+            await status_msg.edit_text(
+                "⚠️ Поддерживаются ссылки на:\n"
+                "• <b>Beatport</b>\n• <b>Tidal</b>\n• <b>Qobuz</b>\n• <b>Amazon Music</b>\n• <b>Deezer</b>\n• <b>SoundCloud</b>",
+                parse_mode="HTML",
+            )
+            return
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Ошибка разбора ссылки: {e}")
         return
-
-    status_msg = await message.answer("🔍 Читаю данные трека с Beatport...")
-    meta = await asyncio.wait_for(asyncio.to_thread(parse_beatport, url), timeout=15.0)
 
     clean_artist = meta.get("artist") or "Various Artists"
     clean_title = meta.get("title") or "Track"
@@ -664,7 +1576,10 @@ async def handle_link(message: types.Message):
     dur_str = format_mm_ss(meta.get("duration_sec") or 0)
     excl_badge = " 🔒 <i>(Beatport Exclusive)</i>" if meta.get("is_exclusive") else ""
 
-    lines = [f"🎵 <b>{clean_artist} – {clean_title}</b>{excl_badge}"]
+    lines = [
+        plat_badge,
+        f"🎵 <b>{clean_artist} – {clean_title}</b>{excl_badge}",
+    ]
     if meta.get("label"):
         lbl_str = f"{meta['label']} [{meta['catalog']}]" if meta.get("catalog") else meta["label"]
         lines.append(f"🏷 <b>Label:</b> {lbl_str}")
@@ -672,19 +1587,19 @@ async def handle_link(message: types.Message):
         lines.append(f"💿 <b>Genre:</b> {meta['genre']}")
     if meta.get("bpm") or meta.get("key"):
         lines.append(f"⚡ <b>BPM:</b> {meta.get('bpm') or '—'} | 🎹 <b>Key:</b> {meta.get('key') or '—'}")
-    lines.append(f"⏱ <b>Длительность (Extended):</b> {dur_str}")
-    lines.append("\n👇 <b>Выберите формат для скачивания:</b>")
+    if meta.get("duration_sec"):
+        lines.append(f"⏱ <b>Длительность:</b> {dur_str}")
+    lines.append("\n👇 <b>Выберите формат (рекомендуется FLAC Lossless):</b>")
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="🎧 MP3 (320 kbps)", callback_data=f"dl|{req_id}|mp3|0"),
                 InlineKeyboardButton(text="💎 FLAC (Lossless)", callback_data=f"dl|{req_id}|flac|0"),
                 InlineKeyboardButton(text="💿 WAV", callback_data=f"dl|{req_id}|wav|0"),
+                InlineKeyboardButton(text="🎧 MP3 (320 kbps)", callback_data=f"dl|{req_id}|mp3|0"),
             ]
         ]
     )
-
     await status_msg.edit_text("\n".join(lines), reply_markup=kb, parse_mode="HTML")
 
 
@@ -694,109 +1609,24 @@ async def handle_format_callback(call: CallbackQuery):
     if len(parts) < 4:
         await call.answer("Устаревшая кнопка")
         return
-
     _, req_id, fmt, allow_radio_flag = parts
     allow_radio = allow_radio_flag == "1"
 
-    task_data = _PENDING_TRACKS.get(req_id)
-    if not task_data:
+    if req_id not in _PENDING_TRACKS:
         await call.answer("Сессия трека устарела, отправьте ссылку заново.", show_alert=True)
         return
 
-    url = task_data["url"]
-    meta = task_data["meta"]
-
-    clean_artist = meta.get("artist") or "Artist"
-    clean_title = meta.get("title") or "Track"
-    if meta.get("mix") and meta["mix"].lower() not in clean_title.lower():
-        clean_title = f"{clean_title} ({meta['mix']})"
-
     await call.answer(f"Готовлю {fmt.upper()}...")
-    await call.message.edit_text(
-        f"⏳ <b>{clean_artist} – {clean_title}</b>\n"
-        f"Формат: <b>{fmt.upper()}</b> | Проверка полной Extended-версии...",
-        parse_mode="HTML",
-    )
-
-    try:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            file_path, cover_path, actual_dur = await asyncio.wait_for(
-                asyncio.to_thread(process_download_request, url, meta, fmt, tmp_dir, allow_radio),
-                timeout=55.0,
-            )
-
-            caption_parts = [f"🎵 <b>{clean_artist} – {clean_title}</b>"]
-            if meta.get("label"):
-                lbl_str = f"{meta['label']} [{meta['catalog']}]" if meta.get("catalog") else meta["label"]
-                caption_parts.append(f"🏷 <b>Label:</b> {lbl_str}")
-            if meta.get("genre"):
-                caption_parts.append(f"💿 <b>Genre:</b> {meta['genre']}")
-            if meta.get("bpm"):
-                caption_parts.append(f"⚡ <b>BPM:</b> {meta['bpm']}")
-            if meta.get("key"):
-                caption_parts.append(f"🎹 <b>Key:</b> {meta['key']}")
-            if actual_dur:
-                caption_parts.append(f"⏱ <b>Length:</b> {format_mm_ss(actual_dur)} ({fmt.upper()})")
-            caption_parts.append("\n🎧 <a href='https://musicvibez.org'>MusicVibez.org</a> • <a href='https://specialfordjs.org'>SpecialForDJs.org</a>")
-
-            ext = fmt.lower()
-            clean_filename = f"{clean_artist} - {clean_title}.{ext}".replace("/", "_").replace("\\", "_").replace(":", "")
-            audio_file = FSInputFile(file_path, filename=clean_filename)
-            thumb_file = FSInputFile(cover_path) if cover_path and os.path.exists(cover_path) else None
-
-            await call.message.edit_text(f"🚀 Выгружаю <b>{fmt.upper()}</b> в Telegram...", parse_mode="HTML")
-            await call.message.answer_audio(
-                audio=audio_file,
-                title=clean_title,
-                performer=clean_artist,
-                duration=actual_dur if actual_dur > 0 else None,
-                thumbnail=thumb_file,
-                caption="\n".join(caption_parts),
-                parse_mode="HTML",
-            )
-            await call.message.delete()
-
-    except ValueError as ve:
-        msg_str = str(ve)
-        if msg_str.startswith("EXTENDED_ONLY_ON_BEATPORT|"):
-            _, bp_dur, radio_dur, has_creds = msg_str.split("|")
-            kb = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text=f"⬇️ Всё равно скачать Radio Edit ({radio_dur}) в {fmt.upper()}",
-                            callback_data=f"dl|{req_id}|{fmt}|1",
-                        )
-                    ]
-                ]
-            )
-            await call.message.edit_text(
-                f"⚠️ <b>Внимание: фильтрация Radio Edit!</b>\n\n"
-                f"Трек <b>{clean_artist} – {clean_title}</b> на Beatport имеет длительность <b>{bp_dur} (Extended Mix)</b>, "
-                f"а в открытых стримингах лейбл выложил только урезанную <b>Radio Edit ({radio_dur})</b>.\n\n"
-                f"Бот остановил скачивание урезанной версии.\n\n"
-                f"🔑 <i>Чтобы выкачивать закрытые Extended Mix напрямую с серверов Beatport, подключите аккаунт Beatport Streaming командой</i> <code>/bp_login email пароль</code>.",
-                reply_markup=kb,
-                parse_mode="HTML",
-            )
-        else:
-            await call.message.edit_text(f"❌ {msg_str}", parse_mode="HTML")
-    except Exception as e:
-        logger.exception("Download callback error")
-        await call.message.edit_text(f"❌ {str(e)[:350]}", parse_mode="HTML")
+    await execute_download_and_send(call.message.chat.id, call.message, req_id, fmt, allow_radio)
 
 
 # ==================== HTTP HEALTHCHECK ДЛЯ BLITZ CLOUD ====================
 async def start_healthcheck_server():
-    """
-    Открывает HTTP-порт для Blitz Cloud, чтобы этап 'Starting it up' завершался мгновенно (за 0.1 сек)!
-    """
     app = web.Application()
     app.router.add_get("/", lambda req: web.json_response({"ok": True, "bot": "sweet_music_dl_bot"}))
     app.router.add_get("/health", lambda req: web.json_response({"ok": True}))
     runner = web.AppRunner(app)
     await runner.setup()
-
     ports = {int(os.environ.get("PORT", "8080")), 8080, 8000, 3000}
     for p in ports:
         try:
