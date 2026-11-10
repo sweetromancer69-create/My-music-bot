@@ -426,12 +426,83 @@ def parse_deezer(url: str) -> dict:
     return meta
 
 
+def parse_qobuz_album(aid: str) -> dict:
+    r = requests.get(
+        "https://www.qobuz.com/api.json/0.2/album/get",
+        params={"album_id": aid},
+        headers={"X-App-Id": "735532640", **HEADERS},
+        timeout=12,
+    )
+    r.raise_for_status()
+    d = r.json()
+
+    rel_name = (d.get("title") or "Album").strip()
+    artist_obj = d.get("artist") or {}
+    rel_artist = (artist_obj.get("name") if isinstance(artist_obj, dict) else "Various Artists") or "Various Artists"
+    img_obj = d.get("image") or {}
+    cover = img_obj.get("large") or img_obj.get("small") if isinstance(img_obj, dict) else None
+    label_obj = d.get("label") or {}
+    label = label_obj.get("name") if isinstance(label_obj, dict) else None
+    pub_date = d.get("release_date_original")
+
+    release_meta = {
+        "is_release": True,
+        "type": "release",
+        "platform": "qobuz",
+        "id": aid,
+        "title": rel_name,
+        "artist": rel_artist,
+        "label": label,
+        "catalog": None,
+        "release_date": pub_date,
+        "cover_url": cover,
+        "tracks": [],
+    }
+
+    raw_tracks = d.get("tracks", {}).get("items", [])
+    for t in raw_tracks:
+        perf = t.get("performer") or {}
+        t_artist = (perf.get("name") if isinstance(perf, dict) else rel_artist) or rel_artist
+        t_title = (t.get("title") or "Track").strip()
+        t_mix = (t.get("version") or "").strip() or None
+        dur = int(t.get("duration") or 0) or None
+
+        release_meta["tracks"].append({
+            "is_release": False,
+            "platform": "qobuz",
+            "track_id": str(t.get("id")),
+            "artist": t_artist,
+            "title": t_title,
+            "mix": t_mix,
+            "album": rel_name,
+            "label": label,
+            "catalog": None,
+            "genre": None,
+            "bpm": None,
+            "key": None,
+            "isrc": t.get("isrc"),
+            "release_date": pub_date,
+            "cover_url": cover,
+            "duration_sec": dur,
+            "is_exclusive": False,
+        })
+
+    return release_meta
+
+
 def parse_qobuz(url: str) -> dict:
-    m = re.search(r"qobuz\.com/(?:[a-z]{2}-[a-z]{2}/)?track/(?:[^/?#]+/)?(\d+)", url, re.I)
+    real_url = (url or "").strip()
+
+    # Проверяем, альбом ли это
+    m_alb = re.search(r"/album/(?:[^/?#]+/)?([a-z0-9]+)", real_url, re.I)
+    if m_alb:
+        return parse_qobuz_album(m_alb.group(1))
+
+    m = re.search(r"qobuz\.com/(?:[a-z]{2}-[a-z]{2}/)?track/(?:[^/?#]+/)?(\d+)", real_url, re.I)
     if not m:
-        m = re.search(r"/track/(\d+)", url, re.I)
+        m = re.search(r"/track/(\d+)", real_url, re.I)
     if not m:
-        raise ValueError("Не удалось извлечь ID трека из ссылки Qobuz.")
+        raise ValueError("Не удалось извлечь ID трека или альбома из ссылки Qobuz.")
     tid = m.group(1)
 
     meta = {
@@ -699,18 +770,27 @@ def download_from_soundcloud_search(meta: dict, target_format: str, tmp_dir: str
     expected_dur = int(meta.get("duration_sec") or 0)
     clean_artist = (artist.split(",")[0] or "").strip() if artist else ""
 
+    is_bp = (meta.get("platform") == "beatport")
     queries = []
-    # 1. Поиск в SoundCloud
-    if mix and mix.lower() not in title.lower():
-        queries.append(f"scsearch5:{clean_artist} {title} {mix}".strip())
-    queries.append(f"scsearch5:{clean_artist} {title} Extended Mix".strip())
-    queries.append(f"scsearch5:{clean_artist} {title}".strip())
 
-    # 2. Надёжный фоллбэк на YouTube (yt-dlp ytsearch)
-    if mix and mix.lower() not in title.lower():
-        queries.append(f"ytsearch5:{clean_artist} {title} {mix}".strip())
-    queries.append(f"ytsearch5:{clean_artist} {title} Extended Mix".strip())
-    queries.append(f"ytsearch5:{clean_artist} {title}".strip())
+    if is_bp:
+        # Для Beatport в приоритете поиск полного Extended Mix
+        if mix and mix.lower() not in title.lower():
+            queries.append(f"scsearch5:{clean_artist} {title} {mix}".strip())
+        queries.append(f"scsearch5:{clean_artist} {title} Extended Mix".strip())
+        queries.append(f"scsearch5:{clean_artist} {title}".strip())
+
+        if mix and mix.lower() not in title.lower():
+            queries.append(f"ytsearch5:{clean_artist} {title} {mix}".strip())
+        queries.append(f"ytsearch5:{clean_artist} {title} Extended Mix".strip())
+        queries.append(f"ytsearch5:{clean_artist} {title}".strip())
+    else:
+        # Для Deezer, Qobuz и других сервисов ищем оригинальную альбомную версию
+        if mix and mix.lower() not in title.lower():
+            queries.append(f"ytsearch5:{clean_artist} {title} {mix}".strip())
+            queries.append(f"scsearch5:{clean_artist} {title} {mix}".strip())
+        queries.append(f"ytsearch5:{clean_artist} {title}".strip())
+        queries.append(f"scsearch5:{clean_artist} {title}".strip())
 
     ydl_opts = {
         "format": "bestaudio/best",
